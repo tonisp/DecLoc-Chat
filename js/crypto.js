@@ -245,6 +245,55 @@ export function getPublicKeyHex(privKeyBytes) {
   return bytesToHex(getPublicKeyBytes(privKeyBytes));
 }
 
+// Pure-JS secp256k1 ECDH shared secret (x-coordinate of d * liftX(peerPubkey))
+// Used for per-member end-to-end sealed room password rotation (blocked members cannot decrypt!).
+export function computeEcdhSharedSecret(privKeyBytes, peerPubkeyHex) {
+  if (!privKeyBytes || privKeyBytes.length !== 32) throw new Error('Invalid private key');
+  if (typeof peerPubkeyHex !== 'string' || !/^[0-9a-f]{64}$/i.test(peerPubkeyHex)) {
+    throw new Error('Invalid peer public key');
+  }
+  const dPrime = bytesToBigInt(privKeyBytes);
+  if (dPrime <= 0n || dPrime >= N) throw new Error('Invalid private key');
+  const peerPt = liftX(bytesToBigInt(hexToBytes(peerPubkeyHex)));
+  if (!peerPt) throw new Error('Invalid peer public key');
+  const shared = toAffine(pointMul({ X: peerPt.x, Y: peerPt.y, Z: 1n }, dPrime));
+  if (!shared) throw new Error('Invalid ECDH point');
+  return bigIntToBytes32(shared.x);
+}
+
+export async function encryptForPeer(myPrivKeyBytes, peerPubkeyHex, contextStr, obj) {
+  const shared = computeEcdhSharedSecret(myPrivKeyBytes, peerPubkeyHex);
+  const keyBytes = await sha256(concatBytes(utf8ToBytes(`decloc-ecdh:v1:${contextStr}:`), shared));
+  const aesKey = await globalThis.crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['encrypt']);
+  const iv = randomBytes(12);
+  const ct = await globalThis.crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: utf8ToBytes(String(contextStr)) },
+    aesKey,
+    utf8ToBytes(JSON.stringify(obj))
+  );
+  return `${bytesToBase64(iv)}.${bytesToBase64(new Uint8Array(ct))}`;
+}
+
+export async function decryptFromPeer(myPrivKeyBytes, peerPubkeyHex, contextStr, packed) {
+  if (typeof packed !== 'string' || !packed.includes('.')) return null;
+  try {
+    const [ivB64, ctB64] = packed.split('.');
+    const iv = base64ToBytes(ivB64);
+    const ct = base64ToBytes(ctB64);
+    const shared = computeEcdhSharedSecret(myPrivKeyBytes, peerPubkeyHex);
+    const keyBytes = await sha256(concatBytes(utf8ToBytes(`decloc-ecdh:v1:${contextStr}:`), shared));
+    const aesKey = await globalThis.crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
+    const pt = await globalThis.crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv, additionalData: utf8ToBytes(String(contextStr)) },
+      aesKey,
+      ct
+    );
+    return JSON.parse(bytesToUtf8(new Uint8Array(pt)));
+  } catch {
+    return null;
+  }
+}
+
 export async function schnorrSign(msg32, privKey32, auxRand32 = randomBytes(32)) {
   if (msg32.length !== 32 || privKey32.length !== 32 || auxRand32.length !== 32) {
     throw new Error('BIP-340 expects 32-byte inputs');
@@ -587,13 +636,16 @@ export function normalizeRelayUrl(input) {
   }
 }
 
-export function encodeInviteUrl(baseUrl, { name, passphrase, relays, relayMode, customRelay }) {
+export function encodeInviteUrl(baseUrl, { name, passphrase, relays, relayMode, customRelay, creatorPubkey }) {
   const payload = { n: name, p: passphrase };
   if (relayMode === 'custom' && customRelay) {
     payload.m = 'custom';
     payload.r = [customRelay];
   } else if (Array.isArray(relays) && relays.length > 0) {
     payload.r = relays;
+  }
+  if (typeof creatorPubkey === 'string' && /^[0-9a-f]{64}$/i.test(creatorPubkey)) {
+    payload.c = creatorPubkey.toLowerCase();
   }
   const cleanBase = baseUrl.split('#')[0].split('?')[0];
   return `${cleanBase}#join=${base64UrlEncode(JSON.stringify(payload))}`;
@@ -612,13 +664,17 @@ export function decodeInviteHash(hashStr) {
       ? data.r.map(normalizeRelayUrl).filter(Boolean)
       : null;
     const relayMode = data.m === 'custom' && validRelays && validRelays.length > 0 ? 'custom' : 'public';
-    return {
+    const creatorPubkey =
+      typeof data.c === 'string' && /^[0-9a-f]{64}$/i.test(data.c) ? data.c.toLowerCase() : null;
+    const result = {
       name: data.n.trim(),
       passphrase: data.p,
       relays: validRelays && validRelays.length > 0 ? validRelays : null,
       relayMode,
       customRelay: relayMode === 'custom' ? validRelays[0] : null,
     };
+    if (creatorPubkey) result.creatorPubkey = creatorPubkey;
+    return result;
   } catch {
     return null;
   }

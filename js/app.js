@@ -7,6 +7,8 @@ import {
   deriveRoomIdentity,
   encryptRoomPayload,
   decryptRoomPayload,
+  encryptForPeer,
+  decryptFromPeer,
   signNostrEvent,
   generateMasterSeed,
   deriveMasterSeedFromPassword,
@@ -247,6 +249,7 @@ async function startApp() {
     const chId = await joinOrCreateRoom(inv.name, inv.passphrase, {
       relayMode: inv.relayMode || 'public',
       customRelay: inv.customRelay || null,
+      creatorPubkey: inv.creatorPubkey || null,
     });
     if (chId) selectRoom(chId);
   } else if (settings.lastRoomId && roomsState.has(settings.lastRoomId)) {
@@ -284,8 +287,9 @@ async function hydrateRoom(room) {
   const deletedTargets = new Map(); // targetId -> Set(issuerPubkey)
   const verifiedDeletedIds = new Set();
   const archiveEvents = new Map(); // pubkey -> { id, pubkey, lastTag, reservedTags, archivedAtMs, createdAt }
+  const govEvents = new Map(); // evId -> { id, pubkey, action, target, tsMs, createdAt }
 
-  // Pass 1: load deletion tombstones AND member archive records first so deleted/archived data cannot reappear
+  // Pass 1: load deletion tombstones, member archive records, and room governance events first
   for (const item of stored) {
     if (item.type === 'del' && Array.isArray(item.targets) && typeof item.pubkey === 'string') {
       for (const tid of item.targets) {
@@ -296,6 +300,8 @@ async function hydrateRoom(room) {
         }
         issuers.add(item.pubkey);
       }
+    } else if (item.type === 'gov' && typeof item.pubkey === 'string' && typeof item.action === 'string') {
+      govEvents.set(item.id, item);
     } else if (item.type === 'archive' && typeof item.pubkey === 'string' && isValidHandleTag(item.lastTag)) {
       const archivedAtMs = typeof item.archivedAtMs === 'number' ? item.archivedAtMs : (item.createdAt || 0) * 1000;
       const prev = archiveEvents.get(item.pubkey);
@@ -388,6 +394,10 @@ async function hydrateRoom(room) {
     readReceipts,
     nickEvents,
     archiveEvents,
+    govEvents,
+    creatorPubkey: room.creatorPubkey || null,
+    admins: new Set(), // verified admin pubkeys (always includes creatorPubkey)
+    bannedPubkeys: new Map(), // pubkey -> { by, tsMs, lastHandle }
     members: new Map(), // pubkey -> { pubkey, name, isOnline, lastActiveMs, firstSeenMs }
     archivedMembers: new Map(), // pubkey -> { pubkey, lastTag, reservedTags, archivedAtMs }
     archivedTags: new Set(), // retired tags (released FIFO only if tag space saturates)
@@ -409,7 +419,11 @@ async function hydrateRoom(room) {
   return state;
 }
 
-async function joinOrCreateRoom(roomName, passphrase, { relayMode = 'public', customRelay = null } = {}) {
+async function joinOrCreateRoom(
+  roomName,
+  passphrase,
+  { relayMode = 'public', customRelay = null, isCreator = false, creatorPubkey = null } = {}
+) {
   const cleanName = roomName.trim();
   if (!cleanName || !passphrase) return null;
 
@@ -425,13 +439,25 @@ async function joinOrCreateRoom(roomName, passphrase, { relayMode = 'public', cu
     if (existingMode !== finalMode || (finalMode === 'custom' && existingRelay !== normCustom)) {
       showToast(t('roomRelayMismatchToast'), 4000);
     }
+    if (!state.room.creatorPubkey && isHex64(creatorPubkey)) {
+      state.room.creatorPubkey = creatorPubkey.toLowerCase();
+      await saveRoom(state.room);
+      rebuildRoomDirectory(state);
+    }
   } else {
+    const myIdentity = await deriveRoomIdentity(activeMasterSeed, secrets.channelId);
+    const resolvedCreator = isCreator
+      ? myIdentity.pubkeyHex
+      : isHex64(creatorPubkey)
+        ? creatorPubkey.toLowerCase()
+        : null;
     const roomObj = {
       channelId: secrets.channelId,
       name: cleanName,
       passphrase,
       relayMode: finalMode,
       customRelay: finalMode === 'custom' ? normCustom : null,
+      creatorPubkey: resolvedCreator,
       joinedAt: Math.floor(Date.now() / 1000),
       lastActivity: Math.floor(Date.now() / 1000),
       lastReadAt: 0,
@@ -440,6 +466,9 @@ async function joinOrCreateRoom(roomName, passphrase, { relayMode = 'public', cu
     await saveRoom(roomObj);
     state = await hydrateRoom(roomObj);
     syncSubscriptions();
+    if (isCreator) {
+      await publishGovAction(state, 'init', null);
+    }
   }
   renderRoomList();
   return secrets.channelId;
@@ -511,7 +540,24 @@ function normalizeHandleName(name) {
   return String(name || '').trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
+function isHex64(str) {
+  return typeof str === 'string' && /^[0-9a-f]{64}$/i.test(str);
+}
+
+function isRoomAdmin(state, pubkey = state?.identity?.pubkeyHex) {
+  return Boolean(state && pubkey && state.admins?.has(pubkey));
+}
+
+function isRoomCreator(state, pubkey = state?.identity?.pubkeyHex) {
+  return Boolean(state && pubkey && state.creatorPubkey === pubkey);
+}
+
+function isMemberBanned(state, pubkey) {
+  return Boolean(state && pubkey && state.bannedPubkeys?.has(pubkey));
+}
+
 function isBlockedByArchive(state, pubkey, tsMs) {
+  if (isMemberBanned(state, pubkey)) return true;
   const arch = state?.archiveEvents?.get(pubkey);
   return Boolean(arch && Number(tsMs || 0) <= arch.archivedAtMs);
 }
@@ -539,18 +585,56 @@ function renderMyRoomHandle(state) {
   const btn = $('myHandleBtn');
   if (!btn || !state) return;
   const handle = getRoomHandle(state, settings.name, state.identity.pubkeyHex);
-  btn.textContent = `👤 ${handle}`;
+  const adminPrefix = isRoomAdmin(state) ? '👑 ' : '👤 ';
+  btn.textContent = `${adminPrefix}${handle}`;
   btn.title = t('myHandleTooltip');
 }
 
 // Reconstruct the entire room directory in one deterministic pass:
-// 1) Permanently reserves all archived tags (never reusable in this room!)
-// 2) Assigns non-colliding chronological 4-char tags for every (pubkey, name)
+// 0) Replays signed room governance events (creator, admins, blocked members)
+// 1) Permanently reserves all archived tags (released FIFO only if space saturates)
+// 2) Assigns non-colliding chronological tags for every (pubkey, name)
 // 3) Rebuilds every user's verified name-change hash-chain ("plokiahel")
 // 4) Builds persistent Members (online + offline) AND Archived Members (archived-xxxx, zero names)
 function rebuildRoomDirectory(state) {
   const channelId = state.room.channelId;
   const myPubkey = state.identity.pubkeyHex;
+
+  // 0. Replay signed Room Governance Chain (founding creator -> co-admins -> member blocks)
+  const sortedGov = [...(state.govEvents ? state.govEvents.values() : [])].sort(
+    (a, b) => (a.tsMs || 0) - (b.tsMs || 0) || String(a.id || '').localeCompare(String(b.id || ''))
+  );
+  let creatorPubkey = isHex64(state.room?.creatorPubkey) ? state.room.creatorPubkey.toLowerCase() : null;
+  if (!creatorPubkey) {
+    const firstInit = sortedGov.find((g) => g.action === 'init' && isHex64(g.pubkey));
+    if (firstInit) {
+      creatorPubkey = firstInit.pubkey.toLowerCase();
+      state.room.creatorPubkey = creatorPubkey;
+      saveRoom(state.room).catch(() => {});
+    }
+  }
+  const admins = new Set();
+  if (creatorPubkey) admins.add(creatorPubkey);
+  const bannedPubkeys = new Map(); // pubkey -> { by, tsMs }
+
+  for (const g of sortedGov) {
+    const actor = String(g.pubkey || '').toLowerCase();
+    if (!admins.has(actor)) continue; // Ignore any forged governance event from a non-admin!
+    const target = isHex64(g.target) ? g.target.toLowerCase() : null;
+    if (g.action === 'grant_admin' && target && !bannedPubkeys.has(target)) {
+      admins.add(target);
+    } else if (g.action === 'revoke_admin' && target && target !== creatorPubkey) {
+      admins.delete(target);
+    } else if (g.action === 'ban' && target && target !== creatorPubkey) {
+      admins.delete(target);
+      bannedPubkeys.set(target, { by: actor, tsMs: g.tsMs || Date.now() });
+    } else if (g.action === 'unban' && target) {
+      bannedPubkeys.delete(target);
+    }
+  }
+  state.creatorPubkey = creatorPubkey;
+  state.admins = admins;
+  state.bannedPubkeys = bannedPubkeys;
 
   const archivedTags = new Set();
   const archivedFifoQueue = []; // oldest-first FIFO order for economical recycling if space ever saturates
@@ -785,9 +869,9 @@ function rebuildRoomDirectory(state) {
     });
   }
 
-  // 4. Archived members (departed & data-erased): ONLY show those not currently active or FIFO-recycled
+  // 4. Archived members (departed & data-erased): ONLY show those not currently active, banned, or FIFO-recycled
   for (const [pk, arch] of state.archiveEvents.entries()) {
-    if (!members.has(pk) && !recycledArchivePubkeys.has(pk)) {
+    if (!members.has(pk) && !bannedPubkeys.has(pk) && !recycledArchivePubkeys.has(pk)) {
       archivedMembers.set(pk, arch);
     }
   }
@@ -879,6 +963,15 @@ function scheduleMembershipAnchor(state) {
     const curr = roomsState.get(chId);
     if (!curr || !pool || !settings.name) return;
     const myPubkey = curr.identity.pubkeyHex;
+
+    // If we are the founding creator, ensure our genesis admin init event was published
+    if (curr.creatorPubkey === myPubkey) {
+      const hasInit = [...curr.govEvents.values()].some((g) => g.pubkey === myPubkey && g.action === 'init');
+      if (!hasInit) {
+        await publishGovAction(curr, 'init', null);
+      }
+    }
+
     const chain = curr.nameChains.get(myPubkey) || [];
     const hasMyNickBlock = [...curr.nickEvents.values()].some(
       (n) => n.pubkey === myPubkey && !isBlockedByArchive(curr, myPubkey, typeof n.tsMs === 'number' ? n.tsMs : n.createdAt * 1000)
@@ -892,6 +985,252 @@ function scheduleMembershipAnchor(state) {
     }
   }, 1500);
   membershipAnchorTimers.set(chId, timer);
+}
+
+async function scrubBannedMemberData(state, targetPubkey) {
+  const pk = String(targetPubkey || '').toLowerCase();
+  if (!state || !isHex64(pk)) return;
+  const scrubIds = [];
+
+  for (const [id, m] of [...state.messages.entries()]) {
+    if (m.pubkey === pk) {
+      state.messages.delete(id);
+      state.reactions.delete(id);
+      state.verifiedDeletedIds.add(id);
+      scrubIds.push(id);
+      if (replyTarget && replyTarget.id === id) {
+        replyTarget = null;
+        renderReplyBar();
+      }
+    }
+  }
+  for (const [id, n] of [...state.nickEvents.entries()]) {
+    if (n.pubkey === pk) {
+      state.nickEvents.delete(id);
+      scrubIds.push(id);
+    }
+  }
+  if (state.readReceipts.has(pk)) {
+    state.readReceipts.delete(pk);
+    scrubIds.push(`read:${state.room.channelId}:${pk}`);
+  }
+  state.presence.delete(pk);
+  state.typing.delete(pk);
+  for (const byEmoji of state.reactions.values()) {
+    for (const byUser of byEmoji.values()) {
+      byUser.delete(pk);
+    }
+  }
+  if (scrubIds.length > 0) {
+    await deleteMessagesByIds(scrubIds);
+  }
+  rebuildRoomDirectory(state);
+  recomputeRoomPreview(state);
+  await saveRoom(state.room);
+}
+
+async function publishGovAction(state, action, targetPubkey = null) {
+  if (!state) return null;
+  const myPubkey = state.identity.pubkeyHex;
+  if (action === 'init') {
+    if (state.creatorPubkey && state.creatorPubkey !== myPubkey) return null;
+    state.creatorPubkey = myPubkey;
+    state.room.creatorPubkey = myPubkey;
+    await saveRoom(state.room);
+  } else {
+    if (!isRoomAdmin(state, myPubkey)) return null;
+  }
+
+  const cleanTarget = isHex64(targetPubkey) ? targetPubkey.toLowerCase() : null;
+  const ts = Date.now();
+  const payload = {
+    v: 1,
+    t: 'gov',
+    action,
+    target: cleanTarget,
+    ts,
+  };
+
+  const content = await encryptRoomPayload(
+    state.aesKey,
+    myPubkey,
+    state.room.channelId,
+    payload
+  );
+
+  const tags = [['e', state.room.channelId, '', 'root']];
+  if (action === 'init') tags.push(['d_admin_init', '1']);
+  else if (action === 'grant_admin' && cleanTarget) tags.push(['d_admin_grant', cleanTarget]);
+  else if (action === 'revoke_admin' && cleanTarget) tags.push(['d_admin_revoke', cleanTarget]);
+  else if (action === 'ban' && cleanTarget) tags.push(['d_admin_ban', cleanTarget]);
+  else if (action === 'unban' && cleanTarget) tags.push(['d_admin_unban', cleanTarget]);
+
+  const ev = await signNostrEvent(
+    {
+      kind: CONFIG.MSG_KIND,
+      tags,
+      content,
+    },
+    state.identity.privKeyBytes
+  );
+
+  const govItem = {
+    id: ev.id,
+    channelId: state.room.channelId,
+    type: 'gov',
+    pubkey: myPubkey,
+    action,
+    target: cleanTarget,
+    tsMs: ts,
+    createdAt: ev.created_at,
+  };
+
+  state.govEvents.set(govItem.id, govItem);
+  await saveMessage(govItem);
+  rebuildRoomDirectory(state);
+  if (action === 'ban' && cleanTarget) {
+    await scrubBannedMemberData(state, cleanTarget);
+  }
+  if (pool) pool.publish(ev, getRoomRelays(state.room));
+  return govItem;
+}
+
+async function leaveRoomByIdLocally(channelId) {
+  const state = roomsState.get(channelId);
+  if (!state) return;
+  clearTimeout(membershipAnchorTimers.get(channelId));
+  membershipAnchorTimers.delete(channelId);
+  if (callManager?.activeChannelId === channelId) {
+    stopCallRingtone();
+    await callManager.leaveCall();
+  }
+  announcePresence(channelId, 'leave');
+
+  await deleteRoom(channelId);
+  roomsState.delete(channelId);
+  const wasActive = activeChannelId === channelId;
+  if (wasActive) activeChannelId = null;
+  syncSubscriptions();
+  renderRoomList();
+  updateTabTitle();
+
+  if (wasActive) {
+    if (roomsState.size > 0) {
+      selectRoom([...roomsState.keys()][0]);
+    } else {
+      $('chatView').classList.add('hidden');
+      $('emptyState').classList.remove('hidden');
+      $('appShell').classList.remove('mobile-chat-open');
+    }
+  }
+}
+
+// Admin Action: Rotate room password via per-member secp256k1 ECDH sealed envelopes.
+// Every non-blocked member automatically migrates to the new room; blocked users cannot decrypt the new password!
+async function rotateRoomPassword(channelId) {
+  const state = roomsState.get(channelId);
+  if (!state || !isRoomAdmin(state)) return;
+  if (!confirm(t('rotatePassConfirm'))) return;
+
+  rebuildRoomDirectory(state);
+  const myPubkey = state.identity.pubkeyHex;
+  const newPassphrase = generatePassphrase();
+  const newSecrets = await deriveRoomSecrets(state.room.name, newPassphrase);
+  const newMyIdentity = await deriveRoomIdentity(activeMasterSeed, newSecrets.channelId);
+
+  const rekeyInfo = {
+    name: state.room.name,
+    passphrase: newPassphrase,
+    relayMode: state.room.relayMode || 'public',
+    customRelay: state.room.customRelay || null,
+    creatorPubkey: newMyIdentity.pubkeyHex,
+  };
+
+  // Seal an individual ECDH envelope for every non-blocked active member
+  const envelopes = {};
+  for (const memberPk of state.members.keys()) {
+    if (memberPk === myPubkey || state.bannedPubkeys.has(memberPk)) continue;
+    try {
+      envelopes[memberPk] = await encryptForPeer(
+        state.identity.privKeyBytes,
+        memberPk,
+        `rekey:${channelId}`,
+        rekeyInfo
+      );
+    } catch {
+      // skip invalid pubkey
+    }
+  }
+
+  const payload = {
+    v: 1,
+    t: 'rekey',
+    envelopes,
+    ts: Date.now(),
+  };
+
+  const content = await encryptRoomPayload(state.aesKey, myPubkey, channelId, payload);
+  const ev = await signNostrEvent(
+    {
+      kind: CONFIG.MSG_KIND,
+      tags: [['e', channelId, '', 'root']],
+      content,
+    },
+    state.identity.privKeyBytes
+  );
+  if (pool) pool.publish(ev, getRoomRelays(state.room));
+
+  // Give WebSockets a moment to flush the rekey event before switching rooms
+  await new Promise((r) => setTimeout(r, 180));
+  hideOverlay('onlineModal');
+
+  const newChannelId = await joinOrCreateRoom(state.room.name, newPassphrase, {
+    relayMode: rekeyInfo.relayMode,
+    customRelay: rekeyInfo.customRelay,
+    isCreator: true,
+    creatorPubkey: newMyIdentity.pubkeyHex,
+  });
+  await leaveRoomByIdLocally(channelId);
+  if (newChannelId) {
+    selectRoom(newChannelId);
+    showToast(t('rotatePassSuccessToast'), 4500);
+    openInviteModal();
+  }
+}
+
+// Admin Action: Permanently delete the entire room and all participants' messages everywhere
+async function nukeRoomEverywhere(channelId) {
+  const state = roomsState.get(channelId);
+  if (!state || !isRoomAdmin(state)) return;
+  if (!confirm(t('adminNukeRoomConfirm', state.room.name))) return;
+
+  const roomName = state.room.name;
+  const myPubkey = state.identity.pubkeyHex;
+  const payload = {
+    v: 1,
+    t: 'nuke',
+    ts: Date.now(),
+  };
+
+  const content = await encryptRoomPayload(state.aesKey, myPubkey, channelId, payload);
+  const ev = await signNostrEvent(
+    {
+      kind: CONFIG.MSG_KIND,
+      tags: [
+        ['e', channelId, '', 'root'],
+        ['d_room_nuke', '1'],
+      ],
+      content,
+    },
+    state.identity.privKeyBytes
+  );
+  if (pool) pool.publish(ev, getRoomRelays(state.room));
+
+  await new Promise((r) => setTimeout(r, 180));
+  hideOverlay('onlineModal');
+  hideOverlay('leaveRoomModal');
+  await leaveRoomByIdLocally(channelId);
+  showToast(t('roomNukedToast', roomName), 5000);
 }
 
 async function publishNickBlock(state, newName, prevNameIfEmpty = null) {
@@ -1510,8 +1849,90 @@ async function handleIncomingNostrEvent(ev, fromRelayUrl) {
     return;
   }
 
-  // --- Persisted channel messages, reactions, deletions & member archives (kind 42) ---
+  // --- Persisted channel messages, reactions, deletions, governance & member archives (kind 42) ---
   if (ev.kind !== CONFIG.MSG_KIND) return;
+
+  if (payload.t === 'gov' && typeof payload.action === 'string') {
+    if (state.govEvents.has(ev.id)) return;
+    const govItem = {
+      id: ev.id,
+      channelId,
+      type: 'gov',
+      pubkey: ev.pubkey,
+      action: payload.action,
+      target: isHex64(payload.target) ? payload.target.toLowerCase() : null,
+      tsMs: typeof payload.ts === 'number' ? payload.ts : ev.created_at * 1000,
+      createdAt: ev.created_at,
+    };
+    state.govEvents.set(govItem.id, govItem);
+    await saveMessage(govItem);
+    rebuildRoomDirectory(state);
+
+    // If a verified admin just banned a member, scrub their data or kick us if we are the banned target
+    if (payload.action === 'ban' && govItem.target && state.bannedPubkeys.has(govItem.target)) {
+      if (govItem.target === state.identity.pubkeyHex) {
+        const rName = state.room.name;
+        await leaveRoomByIdLocally(channelId);
+        showToast(t('youWereBannedToast', rName), 5000);
+        return;
+      }
+      await scrubBannedMemberData(state, govItem.target);
+    }
+
+    if (channelId === activeChannelId) {
+      renderMyRoomHandle(state);
+      renderMessages(false);
+      renderOnlineCount();
+      if (!$('onlineModal').classList.contains('hidden')) openOnlineModal();
+    }
+    renderRoomList();
+    updateTabTitle();
+    return;
+  }
+
+  if (payload.t === 'nuke') {
+    rebuildRoomDirectory(state);
+    if (!isRoomAdmin(state, ev.pubkey)) return;
+    const rName = state.room.name;
+    await leaveRoomByIdLocally(channelId);
+    showToast(t('roomNukedToast', rName), 5000);
+    return;
+  }
+
+  if (payload.t === 'rekey' && payload.envelopes && typeof payload.envelopes === 'object') {
+    rebuildRoomDirectory(state);
+    if (!isRoomAdmin(state, ev.pubkey)) return;
+    const myPubkey = state.identity.pubkeyHex;
+    const myEnv = payload.envelopes[myPubkey];
+    if (typeof myEnv === 'string') {
+      const secret = await decryptFromPeer(
+        state.identity.privKeyBytes,
+        ev.pubkey,
+        `rekey:${channelId}`,
+        myEnv
+      );
+      if (secret && typeof secret.name === 'string' && typeof secret.passphrase === 'string') {
+        const wasActive = activeChannelId === channelId;
+        const newChId = await joinOrCreateRoom(secret.name, secret.passphrase, {
+          relayMode: secret.relayMode || 'public',
+          customRelay: secret.customRelay || null,
+          creatorPubkey: secret.creatorPubkey || null,
+        });
+        await leaveRoomByIdLocally(channelId);
+        if (newChId && wasActive) {
+          selectRoom(newChId);
+        }
+        showToast(t('roomRekeyedAutoToast', secret.name), 5000);
+        return;
+      }
+    }
+    if (channelId === activeChannelId) {
+      showToast(t('roomRekeyedLockedBanner'), 6000);
+    }
+    return;
+  }
+
+  if (isMemberBanned(state, ev.pubkey)) return;
 
   if (payload.t === 'archive') {
     const rawLast = isValidHandleTag(payload.lastTag)
@@ -2102,6 +2523,13 @@ function renderMessages(scrollToBottom) {
       tagSpan.textContent = `-${getRoomTag(state, m.pubkey, m.name)}`;
 
       authorBtn.append(nameSpan, tagSpan);
+
+      if (isRoomAdmin(state, m.pubkey)) {
+        const admBadge = document.createElement('span');
+        admBadge.className = 'admin-badge';
+        admBadge.textContent = t('adminTag');
+        authorBtn.appendChild(admBadge);
+      }
 
       const userChain = state.nameChains.get(m.pubkey);
       if (userChain && userChain.length > 1) {
@@ -3034,7 +3462,10 @@ function openUserHistoryModal(channelId, pubkey) {
   av.style.background = colorFromPubkey(pubkey);
   av.textContent = (currentName[0] || '?').toUpperCase();
 
-  $('userHistoryHandle').textContent = isMe ? `${currentHandle} (${t('youTag')})` : currentHandle;
+  const tags = [];
+  if (isMe) tags.push(t('youTag'));
+  if (isRoomAdmin(state, pubkey)) tags.push(t('adminTag'));
+  $('userHistoryHandle').textContent = tags.length > 0 ? `${currentHandle} (${tags.join(', ')})` : currentHandle;
   $('userHistoryStatus').textContent =
     blocks.length > 1 ? t('userHistoryVerified', blocks.length) : t('userHistorySingle');
   $('userHistoryPubkey').textContent = `${pubkey.slice(0, 12)}…${pubkey.slice(-8)}`;
@@ -3158,6 +3589,7 @@ function openInviteModal() {
     passphrase: state.room.passphrase,
     relayMode: isCustom ? 'custom' : 'public',
     customRelay: isCustom ? state.room.customRelay : null,
+    creatorPubkey: state.creatorPubkey || state.room.creatorPubkey || null,
   });
 
   invitePassVisible = false;
@@ -3190,6 +3622,7 @@ function openOnlineModal() {
 
   const list = $('onlineList');
   list.textContent = '';
+  const iAmAdmin = isRoomAdmin(state);
 
   // 1. Active room members (Online first, then Offline by most recent activity)
   const membersList = [...state.members.values()].sort((a, b) => {
@@ -3204,6 +3637,9 @@ function openOnlineModal() {
   list.appendChild(activeHeading);
 
   for (const r of membersList) {
+    const rowWrap = document.createElement('div');
+    rowWrap.className = 'member-item-wrap';
+
     const item = document.createElement('button');
     item.type = 'button';
     item.className = 'online-row online-row-btn';
@@ -3229,10 +3665,21 @@ function openOnlineModal() {
     const nm = document.createElement('span');
     const handle = getRoomHandle(state, r.name, r.pubkey);
     nm.textContent = r.isMe ? `${handle} (${t('youTag')})` : handle;
+    topRow.appendChild(nm);
+
+    const memberIsAdmin = isRoomAdmin(state, r.pubkey);
+    const memberIsCreator = isRoomCreator(state, r.pubkey);
+    if (memberIsAdmin) {
+      const admPill = document.createElement('span');
+      admPill.className = 'admin-badge';
+      admPill.textContent = `👑 ${t('adminTag')}`;
+      topRow.appendChild(admPill);
+    }
+
     const badge = document.createElement('span');
     badge.className = 'member-status-badge' + (r.isOnline ? ' is-online' : '');
     badge.textContent = r.isOnline ? t('memberOnlineStatus') : t('memberOfflineStatus');
-    topRow.append(nm, badge);
+    topRow.appendChild(badge);
 
     const sub = document.createElement('div');
     sub.className = 'muted small';
@@ -3250,17 +3697,97 @@ function openOnlineModal() {
 
     info.append(topRow, sub);
     item.append(avWrap, info);
-    list.appendChild(item);
+    rowWrap.appendChild(item);
+
+    // Admin actions on other non-creator members (+Admin / -Admin / Block)
+    if (iAmAdmin && !r.isMe && !memberIsCreator) {
+      const actWrap = document.createElement('div');
+      actWrap.className = 'member-admin-actions';
+
+      const admBtn = document.createElement('button');
+      admBtn.type = 'button';
+      admBtn.className = 'btn btn-secondary btn-xs';
+      admBtn.textContent = memberIsAdmin ? t('revokeAdminBtn') : t('grantAdminBtn');
+      admBtn.addEventListener('click', async () => {
+        const confirmMsg = memberIsAdmin ? t('revokeAdminConfirm', handle) : t('grantAdminConfirm', handle);
+        if (!confirm(confirmMsg)) return;
+        await publishGovAction(state, memberIsAdmin ? 'revoke_admin' : 'grant_admin', r.pubkey);
+        showToast(memberIsAdmin ? t('adminRevokedToast', handle) : t('adminGrantedToast', handle));
+        openOnlineModal();
+        renderMessages(false);
+      });
+
+      const banBtn = document.createElement('button');
+      banBtn.type = 'button';
+      banBtn.className = 'btn btn-danger btn-xs';
+      banBtn.textContent = t('banMemberBtn');
+      banBtn.addEventListener('click', async () => {
+        if (!confirm(t('banMemberConfirm', handle))) return;
+        await publishGovAction(state, 'ban', r.pubkey);
+        showToast(t('memberBannedToast', handle));
+        openOnlineModal();
+        renderMessages(false);
+        renderOnlineCount();
+        renderRoomList();
+      });
+
+      actWrap.append(admBtn, banBtn);
+      rowWrap.appendChild(actWrap);
+    }
+
+    list.appendChild(rowWrap);
   }
 
-  if (membersList.length === 1 && state.archivedMembers.size === 0) {
+  if (membersList.length === 1 && state.archivedMembers.size === 0 && state.bannedPubkeys.size === 0) {
     const note = document.createElement('p');
     note.className = 'hint-text';
     note.textContent = t('noOneOnline');
     list.appendChild(note);
   }
 
-  // 2. Archived members (left & erased their data — display name scrubbed, ONLY last 4-char tag remains!)
+  // 2. Blocked members section (visible to Admins to review or unblock)
+  if (iAmAdmin && state.bannedPubkeys.size > 0) {
+    const divB = document.createElement('div');
+    divB.className = 'divider';
+    list.appendChild(divB);
+
+    const banHeading = document.createElement('div');
+    banHeading.className = 'members-section-title';
+    banHeading.textContent = t('blockedMembersTitle', state.bannedPubkeys.size);
+    list.appendChild(banHeading);
+
+    for (const [bannedPk, banInfo] of state.bannedPubkeys.entries()) {
+      const row = document.createElement('div');
+      row.className = 'archived-row';
+      const av = document.createElement('div');
+      av.className = 'archived-avatar';
+      av.textContent = '🚫';
+      const info = document.createElement('div');
+      info.style.flex = '1';
+      const codeEl = document.createElement('div');
+      codeEl.className = 'archived-handle';
+      codeEl.textContent = `blocked-${deriveHandleTag(bannedPk, state.room.channelId, '')}`;
+      const subEl = document.createElement('div');
+      subEl.className = 'muted small';
+      subEl.textContent = `${t('blockedMemberSub')} · ${formatSeenTime(banInfo.tsMs || Date.now())}`;
+      info.append(codeEl, subEl);
+
+      const unbanBtn = document.createElement('button');
+      unbanBtn.type = 'button';
+      unbanBtn.className = 'btn btn-secondary btn-xs';
+      unbanBtn.textContent = t('unbanMemberBtn');
+      unbanBtn.addEventListener('click', async () => {
+        await publishGovAction(state, 'unban', bannedPk);
+        showToast(t('memberUnbannedToast'));
+        openOnlineModal();
+      });
+
+      row.append(av, info, unbanBtn);
+      list.appendChild(row);
+    }
+  }
+
+  // 3. Archived members (left & erased their data — display name scrubbed, ONLY last tag remains!)
   const archivedList = [...state.archivedMembers.values()].sort(
     (a, b) => (b.archivedAtMs || 0) - (a.archivedAtMs || 0)
   );
@@ -3296,6 +3823,40 @@ function openOnlineModal() {
     archHint.className = 'hint-text';
     archHint.textContent = t('archivedMembersHint');
     list.appendChild(archHint);
+  }
+
+  // 4. Admin Controls Panel (Rotate room password & Delete entire room everywhere)
+  if (iAmAdmin) {
+    const divA = document.createElement('div');
+    divA.className = 'divider';
+    list.appendChild(divA);
+
+    const admBox = document.createElement('div');
+    admBox.className = 'admin-panel-box';
+
+    const admTitle = document.createElement('div');
+    admTitle.className = 'members-section-title';
+    admTitle.textContent = `👑 ${t('adminControlsTitle')}`;
+    admBox.appendChild(admTitle);
+
+    const rotBtn = document.createElement('button');
+    rotBtn.type = 'button';
+    rotBtn.className = 'btn btn-secondary btn-sm';
+    rotBtn.textContent = t('rotatePassBtn');
+    rotBtn.addEventListener('click', () => rotateRoomPassword(state.room.channelId));
+
+    const nukeBtn = document.createElement('button');
+    nukeBtn.type = 'button';
+    nukeBtn.className = 'btn btn-danger btn-sm';
+    nukeBtn.textContent = t('adminNukeRoomBtn');
+    nukeBtn.addEventListener('click', () => nukeRoomEverywhere(state.room.channelId));
+
+    const admNote = document.createElement('p');
+    admNote.className = 'hint-text';
+    admNote.textContent = t('adminHintNote');
+
+    admBox.append(rotBtn, nukeBtn, admNote);
+    list.appendChild(admBox);
   }
 
   showOverlay('onlineModal');
@@ -3814,7 +4375,11 @@ function bindEvents() {
     btn.disabled = true;
     btn.textContent = t('derivingKeys');
     try {
-      const chId = await joinOrCreateRoom(name, pass, { relayMode, customRelay });
+      const chId = await joinOrCreateRoom(name, pass, {
+        relayMode,
+        customRelay,
+        isCreator: true,
+      });
       hideOverlay('createRoomModal');
       if (chId) {
         selectRoom(chId);
@@ -3854,20 +4419,26 @@ function bindEvents() {
     let pass = $('joinRoomPass').value;
     let relayMode = $('joinRelayCustom').checked ? 'custom' : 'public';
     let customRelay = relayMode === 'custom' ? normalizeRelayUrl($('joinCustomRelayInput').value) : null;
+    let creatorPubkey = null;
 
     const pasted = $('joinInvitePaste').value.trim();
-    if (pasted && (!name || !pass)) {
+    if (pasted) {
       const hashIdx = pasted.indexOf('#');
       const parsed = decodeInviteHash(hashIdx >= 0 ? pasted.slice(hashIdx) : pasted);
-      if (!parsed) {
+      if (!parsed && (!name || !pass)) {
         $('joinRoomError').textContent = t('errInvalidInvite');
         $('joinRoomError').classList.remove('hidden');
         return;
       }
-      name = parsed.name;
-      pass = parsed.passphrase;
-      relayMode = parsed.relayMode;
-      customRelay = parsed.customRelay;
+      if (parsed) {
+        creatorPubkey = parsed.creatorPubkey || null;
+        if (!name || !pass) {
+          name = parsed.name;
+          pass = parsed.passphrase;
+          relayMode = parsed.relayMode;
+          customRelay = parsed.customRelay;
+        }
+      }
     }
 
     if (!name || !pass) {
@@ -3885,7 +4456,11 @@ function bindEvents() {
     btn.disabled = true;
     btn.textContent = t('derivingKeys');
     try {
-      const chId = await joinOrCreateRoom(name, pass, { relayMode, customRelay });
+      const chId = await joinOrCreateRoom(name, pass, {
+        relayMode,
+        customRelay,
+        creatorPubkey,
+      });
       hideOverlay('joinRoomModal');
       if (chId) {
         selectRoom(chId);
@@ -4082,7 +4657,13 @@ function bindEvents() {
     $('purgeOwnStayBtn').disabled = ownCount === 0;
     // Always allow erasing profile/name & archiving when leaving, even with 0 messages
     $('purgeOwnAndLeaveBtn').disabled = false;
+    $('adminNukeRoomBtn').classList.toggle('hidden', !isRoomAdmin(state));
     showOverlay('leaveRoomModal');
+  });
+
+  $('adminNukeRoomBtn').addEventListener('click', async () => {
+    if (!activeChannelId) return;
+    await nukeRoomEverywhere(activeChannelId);
   });
 
   $('leaveLocalOnlyBtn').addEventListener('click', async () => {
@@ -4381,6 +4962,7 @@ function bindEvents() {
             await joinOrCreateRoom(r.name, r.passphrase, {
               relayMode: r.relayMode === 'custom' && r.customRelay ? 'custom' : 'public',
               customRelay: r.relayMode === 'custom' ? r.customRelay : null,
+              creatorPubkey: r.creatorPubkey || null,
             });
           }
         }
@@ -4412,6 +4994,7 @@ function bindEvents() {
     const chId = await joinOrCreateRoom(inv.name, inv.passphrase, {
       relayMode: inv.relayMode || 'public',
       customRelay: inv.customRelay || null,
+      creatorPubkey: inv.creatorPubkey || null,
     });
     if (chId) selectRoom(chId);
   });

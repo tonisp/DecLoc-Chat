@@ -28,6 +28,8 @@ import {
   normalizeRelayUrl,
   encodeInviteUrl,
   decodeInviteHash,
+  encryptForPeer,
+  decryptFromPeer,
 } from '../js/crypto.js';
 import { EMOJI_CATEGORIES, searchEmojis } from '../js/emojis.js';
 
@@ -375,4 +377,66 @@ test('Handle tag exhaustion defense: economical FIFO archive recycle first, then
       archivedFifoQueue: [],
     })
   );
+});
+
+test('Secp256k1 ECDH + AES-256-GCM peer-sealed rekey envelopes & creatorPubkey invite hash', async () => {
+  const room = await deriveRoomSecrets('Tuba Admin', 'vana-parool-123');
+  const admin = await deriveRoomIdentity(generateMasterSeed(), room.channelId);
+  const honestMember = await deriveRoomIdentity(generateMasterSeed(), room.channelId);
+  const bannedMember = await deriveRoomIdentity(generateMasterSeed(), room.channelId);
+
+  const rekeyPayload = {
+    name: 'Tuba Admin',
+    passphrase: 'uus-parool-456-xyz',
+    relayMode: 'public',
+    customRelay: null,
+    creatorPubkey: admin.pubkeyHex,
+  };
+
+  // Admin seals new room passphrase strictly for honestMember
+  const envelope = await encryptForPeer(
+    admin.privKeyBytes,
+    honestMember.pubkeyHex,
+    room.channelId,
+    rekeyPayload
+  );
+  assert.equal(typeof envelope, 'string');
+  assert.equal(envelope.includes('uus-parool-456-xyz'), false);
+
+  // Honest member decrypts with their private key + admin's pubkey
+  const decrypted = await decryptFromPeer(
+    honestMember.privKeyBytes,
+    admin.pubkeyHex,
+    room.channelId,
+    envelope
+  );
+  assert.deepEqual(decrypted, rekeyPayload);
+
+  // Banned member (or any other room participant who knew the old room key) CANNOT decrypt the envelope
+  const bannedAttempt = await decryptFromPeer(
+    bannedMember.privKeyBytes,
+    admin.pubkeyHex,
+    room.channelId,
+    envelope
+  );
+  assert.equal(bannedAttempt, null);
+
+  // Wrong sender pubkey or wrong channelId AAD fails decryption
+  const spoofAttempt = await decryptFromPeer(
+    honestMember.privKeyBytes,
+    bannedMember.pubkeyHex,
+    room.channelId,
+    envelope
+  );
+  assert.equal(spoofAttempt, null);
+
+  // Invite URL with creatorPubkey preserves 64-hex founding admin pubkey
+  const urlWithCreator = encodeInviteUrl('https://chat.example.ee/', {
+    name: 'Tuba Admin',
+    passphrase: 'uus-parool-456-xyz',
+    relayMode: 'public',
+    creatorPubkey: admin.pubkeyHex,
+  });
+  const parsedInvite = decodeInviteHash(urlWithCreator.slice(urlWithCreator.indexOf('#')));
+  assert.equal(parsedInvite.creatorPubkey, admin.pubkeyHex);
 });

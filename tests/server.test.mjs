@@ -567,3 +567,237 @@ test('Member archive scrubs names/messages via NIP-09 and leaves only nameless a
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+test('Room Creator & Admin Governance: init creator, grant co-admin, ban & physically wipe member, and nuke entire room on SQLite relay', async () => {
+  const dataDir = makeTempDir();
+  const srv = await createDecLocServer({ port: 0, host: '127.0.0.1', dataDir });
+  const info = await srv.start();
+
+  try {
+    const room = await deriveRoomSecrets('Admin Tuba', 'admin-saladus-999');
+    const creator = await deriveRoomIdentity(generateMasterSeed(), room.channelId);
+    const coAdmin = await deriveRoomIdentity(generateMasterSeed(), room.channelId);
+    const troll = await deriveRoomIdentity(generateMasterSeed(), room.channelId);
+
+    let ready;
+    const conn = new Promise((r) => (ready = r));
+    const pool = new RelayPool([info.wsUrl], {
+      onStatusChange: (s) => {
+        if (s.some((x) => x.status === 'connected')) ready();
+      },
+      onEvent: () => {},
+    });
+    await conn;
+    pool.setSubscribedChannels([room.channelId]);
+
+    // 1. Founding creator registers room creator (`d_admin_init`) and posts a message
+    const initEv = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [
+          ['e', room.channelId, '', 'root'],
+          ['d_admin_init', '1'],
+        ],
+        content: await encryptRoomPayload(room.aesKey, creator.pubkeyHex, room.channelId, {
+          v: 1,
+          t: 'gov',
+          action: 'init',
+          target: creator.pubkeyHex,
+          ts: Date.now(),
+        }),
+      },
+      creator.privKeyBytes
+    );
+    const creatorMsg = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [['e', room.channelId, '', 'root']],
+        content: await encryptRoomPayload(room.aesKey, creator.pubkeyHex, room.channelId, {
+          v: 1,
+          t: 'msg',
+          name: 'Jaan',
+          text: 'Tere tulemast jututuppa!',
+          ts: Date.now(),
+        }),
+      },
+      creator.privKeyBytes
+    );
+    pool.publish(initEv);
+    pool.publish(creatorMsg);
+    await new Promise((r) => setTimeout(r, 100));
+
+    assert.equal(srv.store.isRoomCreator(room.channelId, creator.pubkeyHex), true);
+    assert.equal(srv.store.isRoomAdmin(room.channelId, creator.pubkeyHex), true);
+    assert.equal(srv.store.isRoomAdmin(room.channelId, troll.pubkeyHex), false);
+
+    // 2. Troll posts 2 spam messages
+    const trollMsg1 = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [['e', room.channelId, '', 'root']],
+        content: await encryptRoomPayload(room.aesKey, troll.pubkeyHex, room.channelId, {
+          v: 1,
+          t: 'msg',
+          name: 'Troll',
+          text: 'Spam 1',
+          ts: Date.now(),
+        }),
+      },
+      troll.privKeyBytes
+    );
+    const trollMsg2 = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [['e', room.channelId, '', 'root']],
+        content: await encryptRoomPayload(room.aesKey, troll.pubkeyHex, room.channelId, {
+          v: 1,
+          t: 'msg',
+          name: 'Troll',
+          text: 'Spam 2',
+          ts: Date.now(),
+        }),
+      },
+      troll.privKeyBytes
+    );
+    pool.publish(trollMsg1);
+    pool.publish(trollMsg2);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(srv.store.count(), 4); // initEv + creatorMsg + trollMsg1 + trollMsg2
+
+    // 3. Non-admin (troll) attempts to ban creator or nuke room -> REJECTED by relay!
+    const fakeBan = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [
+          ['e', room.channelId, '', 'root'],
+          ['d_admin_ban', creator.pubkeyHex],
+        ],
+        content: 'fake',
+      },
+      troll.privKeyBytes
+    );
+    const fakeNuke = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [
+          ['e', room.channelId, '', 'root'],
+          ['d_room_nuke', '1'],
+        ],
+        content: 'fake',
+      },
+      troll.privKeyBytes
+    );
+    pool.publish(fakeBan);
+    pool.publish(fakeNuke);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(srv.store.isRoomBanned(room.channelId, creator.pubkeyHex), false);
+    assert.equal(srv.store.count(), 4); // fakeBan & fakeNuke were rejected and not stored!
+
+    // 4. Creator grants admin rights to coAdmin (`d_admin_grant`)
+    const grantEv = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [
+          ['e', room.channelId, '', 'root'],
+          ['d_admin_grant', coAdmin.pubkeyHex],
+        ],
+        content: await encryptRoomPayload(room.aesKey, creator.pubkeyHex, room.channelId, {
+          v: 1,
+          t: 'gov',
+          action: 'grant_admin',
+          target: coAdmin.pubkeyHex,
+          ts: Date.now(),
+        }),
+      },
+      creator.privKeyBytes
+    );
+    pool.publish(grantEv);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(srv.store.isRoomAdmin(room.channelId, coAdmin.pubkeyHex), true);
+
+    // 5. Co-admin cannot ban or demote the founding creator!
+    const coupAttempt = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [
+          ['e', room.channelId, '', 'root'],
+          ['d_admin_ban', creator.pubkeyHex],
+        ],
+        content: 'coup',
+      },
+      coAdmin.privKeyBytes
+    );
+    pool.publish(coupAttempt);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(srv.store.isRoomBanned(room.channelId, creator.pubkeyHex), false);
+    assert.equal(srv.store.isRoomAdmin(room.channelId, creator.pubkeyHex), true);
+
+    // 6. Co-admin bans troll (`d_admin_ban`) -> troll's 2 messages are physically wiped from SQLite and troll is banned!
+    const banTrollEv = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [
+          ['e', room.channelId, '', 'root'],
+          ['d_admin_ban', troll.pubkeyHex],
+        ],
+        content: await encryptRoomPayload(room.aesKey, coAdmin.pubkeyHex, room.channelId, {
+          v: 1,
+          t: 'gov',
+          action: 'ban',
+          target: troll.pubkeyHex,
+          ts: Date.now(),
+        }),
+      },
+      coAdmin.privKeyBytes
+    );
+    pool.publish(banTrollEv);
+    await new Promise((r) => setTimeout(r, 100));
+
+    assert.equal(srv.store.isRoomBanned(room.channelId, troll.pubkeyHex), true);
+    // Remaining in store: initEv + creatorMsg + grantEv + banTrollEv = 4 (both trollMsg1 & trollMsg2 physically erased!)
+    assert.equal(srv.store.count(), 4);
+
+    // 7. Banned troll tries to post another message -> blocked by relay!
+    const trollMsg3 = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [['e', room.channelId, '', 'root']],
+        content: 'still spamming',
+      },
+      troll.privKeyBytes
+    );
+    pool.publish(trollMsg3);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(srv.store.count(), 4);
+
+    // 8. Admin nukes the entire room (`d_room_nuke`) -> physically deletes all room events except the nuke tombstone
+    const nukeEv = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [
+          ['e', room.channelId, '', 'root'],
+          ['d_room_nuke', '1'],
+        ],
+        content: await encryptRoomPayload(room.aesKey, creator.pubkeyHex, room.channelId, {
+          v: 1,
+          t: 'nuke',
+          by: 'Jaan-1234',
+          ts: Date.now(),
+        }),
+      },
+      creator.privKeyBytes
+    );
+    pool.publish(nukeEv);
+    await new Promise((r) => setTimeout(r, 120));
+
+    assert.equal(srv.store.count(), 1);
+    const remaining = srv.store.query([{ kinds: [42], '#e': [room.channelId] }]);
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0].id, nukeEv.id);
+
+    pool.destroy();
+  } finally {
+    await srv.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});

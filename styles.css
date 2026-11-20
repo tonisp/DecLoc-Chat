@@ -1805,6 +1805,56 @@ input:focus, textarea:focus, select:focus {
   color: var(--text-muted);
 }
 
+/* Room Admin Badges & Controls */
+.admin-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 0.68rem;
+  font-weight: 750;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(245, 158, 11, 0.18);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.member-item-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.member-item-wrap .online-row-btn {
+  flex: 1;
+  min-width: 0;
+}
+
+.member-admin-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.btn-xs {
+  padding: 4px 7px;
+  font-size: 0.72rem;
+  border-radius: 7px;
+  font-weight: 650;
+}
+
+.admin-panel-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 12px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  margin-top: 4px;
+}
+
 .online-avatar {
   width: 32px;
   height: 32px;

@@ -199,6 +199,7 @@ export async function exportBackup(settings, masterSeedOverride = null) {
       passphrase: r.passphrase,
       relayMode: r.relayMode === 'custom' && r.customRelay ? 'custom' : 'public',
       customRelay: r.relayMode === 'custom' ? r.customRelay : null,
+      creatorPubkey: r.creatorPubkey || null,
       joinedAt: r.joinedAt,
       lastReadAt: r.lastReadAt || 0,
     })),

@@ -480,9 +480,9 @@
     </div>
   </div>
 
-  <!-- Online Participants Modal -->
+  <!-- Online Participants / Room Members & Admin Modal -->
   <div id="onlineModal" class="overlay hidden" role="dialog" aria-modal="true">
-    <div class="modal card modal-sm">
+    <div class="modal card">
       <div class="modal-header">
         <h3 data-i18n="onlineTitle">Praegu toas</h3>
         <button type="button" class="icon-btn modal-close" data-close-modal="onlineModal">✕</button>
@@ -491,7 +491,7 @@
     </div>
   </div>
 
-  <!-- Leave Room / Delete Own Messages Modal -->
+  <!-- Leave Room / Delete Own Messages / Admin Delete Room Modal -->
   <div id="leaveRoomModal" class="overlay hidden" role="dialog" aria-modal="true">
     <div class="modal card">
       <div class="modal-header">
@@ -504,6 +504,7 @@
         <button id="purgeOwnStayBtn" type="button" class="btn btn-secondary" data-i18n="purgeOwnStayBtn">Kustuta minu sõnumid igalt poolt (jää tuppa)</button>
         <button id="purgeOwnAndLeaveBtn" type="button" class="btn btn-danger" data-i18n="purgeOwnAndLeaveBtn">Kustuta minu sõnumid igalt poolt ja lahku</button>
         <button id="leaveLocalOnlyBtn" type="button" class="btn btn-secondary" data-i18n="leaveLocalOnlyBtn">Lahku ainult sellest seadmest</button>
+        <button id="adminNukeRoomBtn" type="button" class="btn btn-danger hidden" data-i18n="adminNukeRoomBtn">🧨 Kustuta terve jututuba igalt poolt (Admin)</button>
         <div class="modal-footer">
           <button type="button" class="btn btn-ghost" data-close-modal="leaveRoomModal" data-i18n="cancelBtn">Tühista</button>
         </div>

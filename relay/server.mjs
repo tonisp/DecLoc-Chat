@@ -80,6 +80,17 @@ async function createEventStore(dataDir) {
       CREATE INDEX IF NOT EXISTS idx_events_channel_time ON events(channel_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_events_pubkey ON events(pubkey);
       CREATE INDEX IF NOT EXISTS idx_events_kind_time ON events(kind, created_at DESC);
+      CREATE TABLE IF NOT EXISTS room_admins (
+        channel_id TEXT NOT NULL,
+        pubkey TEXT NOT NULL,
+        is_creator INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (channel_id, pubkey)
+      );
+      CREATE TABLE IF NOT EXISTS room_bans (
+        channel_id TEXT NOT NULL,
+        pubkey TEXT NOT NULL,
+        PRIMARY KEY (channel_id, pubkey)
+      );
     `);
 
     const insertStmt = db.prepare(`
@@ -87,7 +98,16 @@ async function createEventStore(dataDir) {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const deleteByOwnerStmt = db.prepare(`DELETE FROM events WHERE id = ? AND pubkey = ?`);
+    const deleteChannelByPubkeyStmt = db.prepare(`DELETE FROM events WHERE channel_id = ? AND pubkey = ?`);
+    const deleteChannelExceptStmt = db.prepare(`DELETE FROM events WHERE channel_id = ? AND id != ?`);
     const countStmt = db.prepare(`SELECT COUNT(*) AS cnt FROM events`);
+    const countChannelAdminsStmt = db.prepare(`SELECT COUNT(*) AS cnt FROM room_admins WHERE channel_id = ?`);
+    const isAdminStmt = db.prepare(`SELECT is_creator FROM room_admins WHERE channel_id = ? AND pubkey = ?`);
+    const upsertAdminStmt = db.prepare(`INSERT OR IGNORE INTO room_admins (channel_id, pubkey, is_creator) VALUES (?, ?, ?)`);
+    const removeAdminStmt = db.prepare(`DELETE FROM room_admins WHERE channel_id = ? AND pubkey = ? AND is_creator = 0`);
+    const addBanStmt = db.prepare(`INSERT OR IGNORE INTO room_bans (channel_id, pubkey) VALUES (?, ?)`);
+    const removeBanStmt = db.prepare(`DELETE FROM room_bans WHERE channel_id = ? AND pubkey = ?`);
+    const isBannedStmt = db.prepare(`SELECT 1 AS banned FROM room_bans WHERE channel_id = ? AND pubkey = ?`);
 
     function rowToEvent(row) {
       return {
@@ -125,6 +145,54 @@ async function createEventStore(dataDir) {
           deleted += Number(info.changes || 0);
         }
         return deleted;
+      },
+      initRoomCreator(channelId, pubkey) {
+        if (!channelId || !pubkey) return false;
+        if (Number(countChannelAdminsStmt.get(channelId).cnt || 0) > 0) return false;
+        upsertAdminStmt.run(channelId, pubkey, 1);
+        return true;
+      },
+      isRoomAdmin(channelId, pubkey) {
+        if (!channelId || !pubkey) return false;
+        return Boolean(isAdminStmt.get(channelId, pubkey));
+      },
+      isRoomCreator(channelId, pubkey) {
+        if (!channelId || !pubkey) return false;
+        const row = isAdminStmt.get(channelId, pubkey);
+        return Boolean(row && row.is_creator === 1);
+      },
+      grantRoomAdmin(channelId, targetPubkey) {
+        if (!channelId || !targetPubkey) return false;
+        removeBanStmt.run(channelId, targetPubkey);
+        upsertAdminStmt.run(channelId, targetPubkey, 0);
+        return true;
+      },
+      revokeRoomAdmin(channelId, targetPubkey) {
+        if (!channelId || !targetPubkey) return false;
+        const info = removeAdminStmt.run(channelId, targetPubkey);
+        return Number(info.changes || 0) > 0;
+      },
+      banRoomMember(channelId, targetPubkey) {
+        if (!channelId || !targetPubkey) return 0;
+        if (this.isRoomCreator(channelId, targetPubkey)) return 0;
+        removeAdminStmt.run(channelId, targetPubkey);
+        addBanStmt.run(channelId, targetPubkey);
+        const info = deleteChannelByPubkeyStmt.run(channelId, targetPubkey);
+        return Number(info.changes || 0);
+      },
+      unbanRoomMember(channelId, targetPubkey) {
+        if (!channelId || !targetPubkey) return false;
+        removeBanStmt.run(channelId, targetPubkey);
+        return true;
+      },
+      isRoomBanned(channelId, pubkey) {
+        if (!channelId || !pubkey) return false;
+        return Boolean(isBannedStmt.get(channelId, pubkey));
+      },
+      nukeRoomExcept(channelId, keepEventId) {
+        if (!channelId) return 0;
+        const info = deleteChannelExceptStmt.run(channelId, keepEventId || '');
+        return Number(info.changes || 0);
       },
       query(filter) {
         const clauses = [];
@@ -172,6 +240,8 @@ async function createEventStore(dataDir) {
     // Pure-JS fallback for Node < 22.5 without node:sqlite
     const filePath = path.join(dataDir, 'events.ndjson');
     const byId = new Map();
+    const roomAdmins = new Map(); // channelId -> { creator, admins: Set }
+    const roomBans = new Map(); // channelId -> Set
     if (fs.existsSync(filePath)) {
       const lines = fs.readFileSync(filePath, 'utf8').split('\n');
       for (const line of lines) {
@@ -192,6 +262,11 @@ async function createEventStore(dataDir) {
       fs.renameSync(tmp, filePath);
     }
 
+    function eventChannel(ev) {
+      const eTag = ev.tags?.find((t) => Array.isArray(t) && t[0] === 'e' && typeof t[1] === 'string');
+      return eTag ? eTag[1] : null;
+    }
+
     return {
       backend: 'ndjson',
       location: filePath,
@@ -205,6 +280,67 @@ async function createEventStore(dataDir) {
         for (const id of targetIds) {
           const existing = byId.get(id);
           if (existing && existing.pubkey === pubkey) {
+            byId.delete(id);
+            deleted++;
+          }
+        }
+        if (deleted > 0) rewriteAll();
+        return deleted;
+      },
+      initRoomCreator(channelId, pubkey) {
+        if (!channelId || !pubkey || roomAdmins.has(channelId)) return false;
+        roomAdmins.set(channelId, { creator: pubkey, admins: new Set([pubkey]) });
+        return true;
+      },
+      isRoomAdmin(channelId, pubkey) {
+        return Boolean(roomAdmins.get(channelId)?.admins.has(pubkey));
+      },
+      isRoomCreator(channelId, pubkey) {
+        return roomAdmins.get(channelId)?.creator === pubkey;
+      },
+      grantRoomAdmin(channelId, targetPubkey) {
+        const rec = roomAdmins.get(channelId);
+        if (!rec || !targetPubkey) return false;
+        roomBans.get(channelId)?.delete(targetPubkey);
+        rec.admins.add(targetPubkey);
+        return true;
+      },
+      revokeRoomAdmin(channelId, targetPubkey) {
+        const rec = roomAdmins.get(channelId);
+        if (!rec || rec.creator === targetPubkey) return false;
+        return rec.admins.delete(targetPubkey);
+      },
+      banRoomMember(channelId, targetPubkey) {
+        const rec = roomAdmins.get(channelId);
+        if (rec && rec.creator === targetPubkey) return 0;
+        rec?.admins.delete(targetPubkey);
+        let b = roomBans.get(channelId);
+        if (!b) {
+          b = new Set();
+          roomBans.set(channelId, b);
+        }
+        b.add(targetPubkey);
+        let deleted = 0;
+        for (const [id, ev] of [...byId.entries()]) {
+          if (eventChannel(ev) === channelId && ev.pubkey === targetPubkey) {
+            byId.delete(id);
+            deleted++;
+          }
+        }
+        if (deleted > 0) rewriteAll();
+        return deleted;
+      },
+      unbanRoomMember(channelId, targetPubkey) {
+        roomBans.get(channelId)?.delete(targetPubkey);
+        return true;
+      },
+      isRoomBanned(channelId, pubkey) {
+        return Boolean(roomBans.get(channelId)?.has(pubkey));
+      },
+      nukeRoomExcept(channelId, keepEventId) {
+        let deleted = 0;
+        for (const [id, ev] of [...byId.entries()]) {
+          if (eventChannel(ev) === channelId && id !== keepEventId) {
             byId.delete(id);
             deleted++;
           }
@@ -809,6 +945,58 @@ export async function createDecLocServer(userOpts = {}) {
         const deleted = store.deleteByOwner(targetIds, ev.pubkey);
         wsSendText(client.socket, JSON.stringify(['OK', ev.id, true, `deleted ${deleted}`]));
         return;
+      }
+
+      const eTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'e' && typeof t[1] === 'string');
+      const channelId = eTag ? eTag[1] : null;
+
+      // Reject events from members banned by a verified room admin
+      if (channelId && store.isRoomBanned(channelId, ev.pubkey)) {
+        wsSendText(client.socket, JSON.stringify(['OK', ev.id, false, 'blocked: banned from room']));
+        return;
+      }
+
+      // Room Admin Governance tags on verified Schnorr-signed kind:42 events (zero-knowledge: no plaintext!)
+      const isHex64 = (s) => typeof s === 'string' && /^[0-9a-f]{64}$/i.test(s);
+      if (channelId && ev.kind === 42) {
+        const initTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'd_admin_init');
+        if (initTag) {
+          store.initRoomCreator(channelId, ev.pubkey);
+        }
+        const grantTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'd_admin_grant' && isHex64(t[1]));
+        const revokeTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'd_admin_revoke' && isHex64(t[1]));
+        const banTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'd_admin_ban' && isHex64(t[1]));
+        const unbanTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'd_admin_unban' && isHex64(t[1]));
+        const nukeTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'd_room_nuke');
+
+        if (grantTag || revokeTag || banTag || unbanTag || nukeTag) {
+          if (!store.isRoomAdmin(channelId, ev.pubkey)) {
+            wsSendText(client.socket, JSON.stringify(['OK', ev.id, false, 'blocked: admin privilege required']));
+            return;
+          }
+          if (grantTag) store.grantRoomAdmin(channelId, grantTag[1].toLowerCase());
+          if (revokeTag) {
+            const target = revokeTag[1].toLowerCase();
+            if (store.isRoomCreator(channelId, target)) {
+              wsSendText(client.socket, JSON.stringify(['OK', ev.id, false, 'blocked: cannot demote room creator']));
+              return;
+            }
+            store.revokeRoomAdmin(channelId, target);
+          }
+          if (banTag) {
+            const target = banTag[1].toLowerCase();
+            if (store.isRoomCreator(channelId, target)) {
+              wsSendText(client.socket, JSON.stringify(['OK', ev.id, false, 'blocked: cannot ban room creator']));
+              return;
+            }
+            store.banRoomMember(channelId, target);
+          }
+          if (unbanTag) store.unbanRoomMember(channelId, unbanTag[1].toLowerCase());
+          if (nukeTag) {
+            store.save(ev); // persist signed nuke tombstone so offline devices also wipe locally
+            store.nukeRoomExcept(channelId, ev.id);
+          }
+        }
       }
 
       // Ephemeral events (20000..29999) are broadcast live without persisting
