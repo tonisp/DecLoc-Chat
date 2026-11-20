@@ -770,7 +770,33 @@ test('Room Creator & Admin Governance: init creator, grant co-admin, ban & physi
     await new Promise((r) => setTimeout(r, 100));
     assert.equal(srv.store.count(), 4);
 
-    // 8. Admin nukes the entire room (`d_room_nuke`) -> physically deletes all room events except the nuke tombstone
+    // 8. Founding creator deletes themselves from the room and transfers admin/creator rights to coAdmin (`d_admin_transfer`)
+    const transferEv = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [
+          ['e', room.channelId, '', 'root'],
+          ['d_admin_grant', coAdmin.pubkeyHex],
+          ['d_admin_transfer', coAdmin.pubkeyHex],
+        ],
+        content: await encryptRoomPayload(room.aesKey, creator.pubkeyHex, room.channelId, {
+          v: 1,
+          t: 'gov',
+          action: 'transfer_admin',
+          target: coAdmin.pubkeyHex,
+          ts: Date.now(),
+        }),
+      },
+      creator.privKeyBytes
+    );
+    pool.publish(transferEv);
+    await new Promise((r) => setTimeout(r, 100));
+
+    assert.equal(srv.store.isRoomAdmin(room.channelId, creator.pubkeyHex), false);
+    assert.equal(srv.store.isRoomAdmin(room.channelId, coAdmin.pubkeyHex), true);
+    assert.equal(srv.store.isRoomCreator(room.channelId, coAdmin.pubkeyHex), true);
+
+    // 9. New successor admin (`coAdmin`) nukes the entire room (`d_room_nuke`) -> physically deletes all room events except the nuke tombstone
     const nukeEv = await signNostrEvent(
       {
         kind: 42,
@@ -778,14 +804,13 @@ test('Room Creator & Admin Governance: init creator, grant co-admin, ban & physi
           ['e', room.channelId, '', 'root'],
           ['d_room_nuke', '1'],
         ],
-        content: await encryptRoomPayload(room.aesKey, creator.pubkeyHex, room.channelId, {
+        content: await encryptRoomPayload(room.aesKey, coAdmin.pubkeyHex, room.channelId, {
           v: 1,
           t: 'nuke',
-          by: 'Jaan-1234',
           ts: Date.now(),
         }),
       },
-      creator.privKeyBytes
+      coAdmin.privKeyBytes
     );
     pool.publish(nukeEv);
     await new Promise((r) => setTimeout(r, 120));

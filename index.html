@@ -501,6 +501,17 @@
       <div class="stack">
         <p id="leaveRoomDesc" class="muted"></p>
         <p class="hint-text" data-i18n="leaveRelayNote"></p>
+        <div id="leaveAdminAloneNotice" class="admin-panel-box hidden">
+          <div class="admin-panel-title" data-i18n="leaveAdminAloneTitle">👑 Oled selles jututoas ainus liige (admin)</div>
+          <p class="small muted" data-i18n="leaveAdminAloneDesc">Enda täielikul kustutamisel jututoast kustutatakse automaatselt ka terve jututuba igalt poolt.</p>
+        </div>
+        <div id="leaveAdminSuccessorBox" class="admin-panel-box hidden">
+          <label class="field">
+            <span data-i18n="leaveSuccessorLabel">👑 Määra uus admin enne enda kustutamist jututoast (saab õiguse ka terve jututoa kustutada)</span>
+            <select id="leaveSuccessorSelect"></select>
+          </label>
+          <p id="leaveAdminSuccessorError" class="error-text hidden" data-i18n="errMustSelectSuccessorAdmin"></p>
+        </div>
         <button id="purgeOwnStayBtn" type="button" class="btn btn-secondary" data-i18n="purgeOwnStayBtn">Kustuta minu sõnumid igalt poolt (jää tuppa)</button>
         <button id="purgeOwnAndLeaveBtn" type="button" class="btn btn-danger" data-i18n="purgeOwnAndLeaveBtn">Kustuta minu sõnumid igalt poolt ja lahku</button>
         <button id="leaveLocalOnlyBtn" type="button" class="btn btn-secondary" data-i18n="leaveLocalOnlyBtn">Lahku ainult sellest seadmest</button>

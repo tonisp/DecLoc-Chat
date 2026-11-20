@@ -600,21 +600,20 @@ function rebuildRoomDirectory(state) {
   const channelId = state.room.channelId;
   const myPubkey = state.identity.pubkeyHex;
 
-  // 0. Replay signed Room Governance Chain (founding creator -> co-admins -> member blocks)
+  // 0. Replay signed Room Governance Chain (founding creator -> co-admins -> admin succession -> member blocks)
   const sortedGov = [...(state.govEvents ? state.govEvents.values() : [])].sort(
     (a, b) => (a.tsMs || 0) - (b.tsMs || 0) || String(a.id || '').localeCompare(String(b.id || ''))
   );
-  let creatorPubkey = isHex64(state.room?.creatorPubkey) ? state.room.creatorPubkey.toLowerCase() : null;
-  if (!creatorPubkey) {
-    const firstInit = sortedGov.find((g) => g.action === 'init' && isHex64(g.pubkey));
-    if (firstInit) {
-      creatorPubkey = firstInit.pubkey.toLowerCase();
-      state.room.creatorPubkey = creatorPubkey;
-      saveRoom(state.room).catch(() => {});
-    }
+  const firstInit = sortedGov.find((g) => g.action === 'init' && isHex64(g.pubkey));
+  const pinnedCreator = isHex64(state.room?.creatorPubkey) ? state.room.creatorPubkey.toLowerCase() : null;
+  let creatorPubkey = firstInit ? firstInit.pubkey.toLowerCase() : pinnedCreator;
+  if (creatorPubkey && !state.room.creatorPubkey) {
+    state.room.creatorPubkey = creatorPubkey;
+    saveRoom(state.room).catch(() => {});
   }
   const admins = new Set();
   if (creatorPubkey) admins.add(creatorPubkey);
+  if (pinnedCreator) admins.add(pinnedCreator);
   const bannedPubkeys = new Map(); // pubkey -> { by, tsMs }
 
   for (const g of sortedGov) {
@@ -623,6 +622,14 @@ function rebuildRoomDirectory(state) {
     const target = isHex64(g.target) ? g.target.toLowerCase() : null;
     if (g.action === 'grant_admin' && target && !bannedPubkeys.has(target)) {
       admins.add(target);
+    } else if (g.action === 'transfer_admin' && target && !bannedPubkeys.has(target)) {
+      admins.add(target);
+      if (actor === creatorPubkey) {
+        creatorPubkey = target;
+      }
+      if (target !== actor) {
+        admins.delete(actor);
+      }
     } else if (g.action === 'revoke_admin' && target && target !== creatorPubkey) {
       admins.delete(target);
     } else if (g.action === 'ban' && target && target !== creatorPubkey) {
@@ -871,9 +878,16 @@ function rebuildRoomDirectory(state) {
 
   // 4. Archived members (departed & data-erased): ONLY show those not currently active, banned, or FIFO-recycled
   for (const [pk, arch] of state.archiveEvents.entries()) {
-    if (!members.has(pk) && !bannedPubkeys.has(pk) && !recycledArchivePubkeys.has(pk)) {
-      archivedMembers.set(pk, arch);
+    if (!members.has(pk)) {
+      admins.delete(pk);
+      if (!bannedPubkeys.has(pk) && !recycledArchivePubkeys.has(pk)) {
+        archivedMembers.set(pk, arch);
+      }
     }
+  }
+  if (creatorPubkey && !admins.has(creatorPubkey)) {
+    creatorPubkey = admins.size > 0 ? [...admins][0] : null;
+    state.creatorPubkey = creatorPubkey;
   }
 
   state.archivedTags = archivedTags;
@@ -1059,11 +1073,21 @@ async function publishGovAction(state, action, targetPubkey = null) {
   );
 
   const tags = [['e', state.room.channelId, '', 'root']];
-  if (action === 'init') tags.push(['d_admin_init', '1']);
-  else if (action === 'grant_admin' && cleanTarget) tags.push(['d_admin_grant', cleanTarget]);
-  else if (action === 'revoke_admin' && cleanTarget) tags.push(['d_admin_revoke', cleanTarget]);
-  else if (action === 'ban' && cleanTarget) tags.push(['d_admin_ban', cleanTarget]);
-  else if (action === 'unban' && cleanTarget) tags.push(['d_admin_unban', cleanTarget]);
+  if (action === 'init' || isRoomCreator(state, myPubkey)) {
+    tags.push(['d_admin_init', '1']);
+  }
+  if (action === 'grant_admin' && cleanTarget) {
+    tags.push(['d_admin_grant', cleanTarget]);
+  } else if (action === 'transfer_admin' && cleanTarget) {
+    tags.push(['d_admin_grant', cleanTarget]);
+    tags.push(['d_admin_transfer', cleanTarget]);
+  } else if (action === 'revoke_admin' && cleanTarget) {
+    tags.push(['d_admin_revoke', cleanTarget]);
+  } else if (action === 'ban' && cleanTarget) {
+    tags.push(['d_admin_ban', cleanTarget]);
+  } else if (action === 'unban' && cleanTarget) {
+    tags.push(['d_admin_unban', cleanTarget]);
+  }
 
   const ev = await signNostrEvent(
     {
@@ -1199,27 +1223,62 @@ async function rotateRoomPassword(channelId) {
 }
 
 // Admin Action: Permanently delete the entire room and all participants' messages everywhere
-async function nukeRoomEverywhere(channelId) {
+async function nukeRoomEverywhere(channelId, { skipConfirm = false } = {}) {
   const state = roomsState.get(channelId);
   if (!state || !isRoomAdmin(state)) return;
-  if (!confirm(t('adminNukeRoomConfirm', state.room.name))) return;
+  if (!skipConfirm && !confirm(t('adminNukeRoomConfirm', state.room.name))) return;
 
   const roomName = state.room.name;
   const myPubkey = state.identity.pubkeyHex;
+
+  // 1. Also send NIP-09 deletion for the admin's own messages & metadata so public relays delete them too
+  const ownMsgIds = [];
+  for (const m of state.messages.values()) {
+    if (m.pubkey === myPubkey) ownMsgIds.push(m.id);
+  }
+  if (ownMsgIds.length > 0) {
+    await deleteOwnMessages(channelId, ownMsgIds);
+  }
+  const ownMetaIds = new Set(state.ownMetaEventIds);
+  for (const n of state.nickEvents.values()) {
+    if (n.pubkey === myPubkey) ownMetaIds.add(n.id);
+  }
+  const metaList = [...ownMetaIds];
+  if (metaList.length > 0 && pool) {
+    for (let i = 0; i < metaList.length; i += 100) {
+      const chunk = metaList.slice(i, i + 100);
+      const nip09Meta = await signNostrEvent(
+        {
+          kind: CONFIG.DELETE_KIND,
+          tags: [...chunk.map((id) => ['e', id]), ['k', String(CONFIG.MSG_KIND)]],
+          content: '',
+        },
+        state.identity.privKeyBytes
+      );
+      pool.publish(nip09Meta, getRoomRelays(state.room));
+    }
+  }
+
+  // 2. Publish signed room nuke tombstone (`d_room_nuke` physically wipes all room events on SQLite relay)
   const payload = {
     v: 1,
     t: 'nuke',
     ts: Date.now(),
   };
 
+  const tags = [
+    ['e', channelId, '', 'root'],
+    ['d_room_nuke', '1'],
+  ];
+  if (isRoomCreator(state, myPubkey)) {
+    tags.push(['d_admin_init', '1']);
+  }
+
   const content = await encryptRoomPayload(state.aesKey, myPubkey, channelId, payload);
   const ev = await signNostrEvent(
     {
       kind: CONFIG.MSG_KIND,
-      tags: [
-        ['e', channelId, '', 'root'],
-        ['d_room_nuke', '1'],
-      ],
+      tags,
       content,
     },
     state.identity.privKeyBytes
@@ -4649,15 +4708,63 @@ function bindEvents() {
     await leaveActiveRoomLocally();
   }
 
+  $('leaveSuccessorSelect').addEventListener('change', () => {
+    if ($('leaveSuccessorSelect').value) {
+      $('leaveAdminSuccessorError').classList.add('hidden');
+    }
+  });
+
   $('leaveRoomBtn').addEventListener('click', () => {
     const state = roomsState.get(activeChannelId);
     if (!state) return;
+    rebuildRoomDirectory(state);
     const ownCount = getOwnMessageIdsInRoom(state).length;
+    const iAmAdmin = isRoomAdmin(state);
+    const myPubkey = state.identity.pubkeyHex;
+    const otherActiveMembers = [...state.members.values()]
+      .filter((m) => m.pubkey !== myPubkey && !state.bannedPubkeys.has(m.pubkey))
+      .sort((a, b) => {
+        if (a.isOnline !== b.isOnline) return a.isOnline ? -1 : 1;
+        return (b.lastActiveMs || 0) - (a.lastActiveMs || 0);
+      });
+
     $('leaveRoomDesc').textContent = t('leaveModalDesc', state.room.name, ownCount);
     $('purgeOwnStayBtn').disabled = ownCount === 0;
     // Always allow erasing profile/name & archiving when leaving, even with 0 messages
     $('purgeOwnAndLeaveBtn').disabled = false;
-    $('adminNukeRoomBtn').classList.toggle('hidden', !isRoomAdmin(state));
+    $('adminNukeRoomBtn').classList.toggle('hidden', !iAmAdmin);
+
+    if (iAmAdmin && otherActiveMembers.length === 0) {
+      $('leaveAdminAloneNotice').classList.remove('hidden');
+      $('leaveAdminSuccessorBox').classList.add('hidden');
+      $('purgeOwnAndLeaveBtn').textContent = t('purgeOwnAndNukeAloneBtn');
+    } else if (iAmAdmin && otherActiveMembers.length > 0) {
+      $('leaveAdminAloneNotice').classList.add('hidden');
+      $('leaveAdminSuccessorBox').classList.remove('hidden');
+      $('leaveAdminSuccessorError').classList.add('hidden');
+      $('purgeOwnAndLeaveBtn').textContent = t('purgeOwnAndLeaveBtn');
+
+      const sel = $('leaveSuccessorSelect');
+      sel.textContent = '';
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = t('leaveSuccessorPlaceholder');
+      sel.appendChild(placeholder);
+
+      for (const m of otherActiveMembers) {
+        const opt = document.createElement('option');
+        opt.value = m.pubkey;
+        const handle = getRoomHandle(state, m.name, m.pubkey);
+        opt.textContent = isRoomAdmin(state, m.pubkey) ? `${handle} (${t('adminTag')})` : handle;
+        sel.appendChild(opt);
+      }
+      sel.value = '';
+    } else {
+      $('leaveAdminAloneNotice').classList.add('hidden');
+      $('leaveAdminSuccessorBox').classList.add('hidden');
+      $('purgeOwnAndLeaveBtn').textContent = t('purgeOwnAndLeaveBtn');
+    }
+
     showOverlay('leaveRoomModal');
   });
 
@@ -4667,6 +4774,13 @@ function bindEvents() {
   });
 
   $('leaveLocalOnlyBtn').addEventListener('click', async () => {
+    const state = roomsState.get(activeChannelId);
+    if (state && isRoomAdmin(state)) {
+      const successorPubkey = $('leaveSuccessorSelect').value;
+      if (successorPubkey && state.members.has(successorPubkey)) {
+        await publishGovAction(state, 'grant_admin', successorPubkey);
+      }
+    }
     hideOverlay('leaveRoomModal');
     await leaveActiveRoomLocally();
   });
@@ -4685,6 +4799,35 @@ function bindEvents() {
   });
 
   $('purgeOwnAndLeaveBtn').addEventListener('click', async () => {
+    const state = roomsState.get(activeChannelId);
+    if (!state) return;
+    rebuildRoomDirectory(state);
+    const iAmAdmin = isRoomAdmin(state);
+    const myPubkey = state.identity.pubkeyHex;
+    const otherActiveMembers = [...state.members.values()].filter(
+      (m) => m.pubkey !== myPubkey && !state.bannedPubkeys.has(m.pubkey)
+    );
+
+    if (iAmAdmin) {
+      // If the admin is the only member in the chatroom, deleting themselves completely deletes the entire room everywhere
+      if (otherActiveMembers.length === 0) {
+        await nukeRoomEverywhere(state.room.channelId, { skipConfirm: true });
+        return;
+      }
+
+      // Otherwise, the admin MUST designate another active member as admin (who can also nuke the room) before deleting themselves
+      const successorPubkey = $('leaveSuccessorSelect').value;
+      if (!successorPubkey || !state.members.has(successorPubkey) || successorPubkey === myPubkey) {
+        $('leaveAdminSuccessorError').textContent = t('errMustSelectSuccessorAdmin');
+        $('leaveAdminSuccessorError').classList.remove('hidden');
+        showToast(t('errMustSelectSuccessorAdmin'), 4000);
+        $('leaveSuccessorSelect').focus();
+        return;
+      }
+
+      await publishGovAction(state, 'transfer_admin', successorPubkey);
+    }
+
     hideOverlay('leaveRoomModal');
     await archiveAndLeaveActiveRoom();
   });

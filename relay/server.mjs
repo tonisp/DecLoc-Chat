@@ -104,7 +104,11 @@ async function createEventStore(dataDir) {
     const countChannelAdminsStmt = db.prepare(`SELECT COUNT(*) AS cnt FROM room_admins WHERE channel_id = ?`);
     const isAdminStmt = db.prepare(`SELECT is_creator FROM room_admins WHERE channel_id = ? AND pubkey = ?`);
     const upsertAdminStmt = db.prepare(`INSERT OR IGNORE INTO room_admins (channel_id, pubkey, is_creator) VALUES (?, ?, ?)`);
+    const upsertCreatorAdminStmt = db.prepare(
+      `INSERT INTO room_admins (channel_id, pubkey, is_creator) VALUES (?, ?, ?) ON CONFLICT(channel_id, pubkey) DO UPDATE SET is_creator = excluded.is_creator`
+    );
     const removeAdminStmt = db.prepare(`DELETE FROM room_admins WHERE channel_id = ? AND pubkey = ? AND is_creator = 0`);
+    const forceRemoveAdminStmt = db.prepare(`DELETE FROM room_admins WHERE channel_id = ? AND pubkey = ?`);
     const addBanStmt = db.prepare(`INSERT OR IGNORE INTO room_bans (channel_id, pubkey) VALUES (?, ?)`);
     const removeBanStmt = db.prepare(`DELETE FROM room_bans WHERE channel_id = ? AND pubkey = ?`);
     const isBannedStmt = db.prepare(`SELECT 1 AS banned FROM room_bans WHERE channel_id = ? AND pubkey = ?`);
@@ -165,6 +169,21 @@ async function createEventStore(dataDir) {
         if (!channelId || !targetPubkey) return false;
         removeBanStmt.run(channelId, targetPubkey);
         upsertAdminStmt.run(channelId, targetPubkey, 0);
+        return true;
+      },
+      transferRoomAdmin(channelId, fromPubkey, targetPubkey) {
+        if (!channelId || !fromPubkey || !targetPubkey) return false;
+        if (!this.isRoomAdmin(channelId, fromPubkey)) return false;
+        const wasCreator = this.isRoomCreator(channelId, fromPubkey);
+        removeBanStmt.run(channelId, targetPubkey);
+        if (wasCreator) {
+          upsertCreatorAdminStmt.run(channelId, targetPubkey, 1);
+        } else {
+          upsertAdminStmt.run(channelId, targetPubkey, 0);
+        }
+        if (targetPubkey !== fromPubkey) {
+          forceRemoveAdminStmt.run(channelId, fromPubkey);
+        }
         return true;
       },
       revokeRoomAdmin(channelId, targetPubkey) {
@@ -303,6 +322,19 @@ async function createEventStore(dataDir) {
         if (!rec || !targetPubkey) return false;
         roomBans.get(channelId)?.delete(targetPubkey);
         rec.admins.add(targetPubkey);
+        return true;
+      },
+      transferRoomAdmin(channelId, fromPubkey, targetPubkey) {
+        const rec = roomAdmins.get(channelId);
+        if (!rec || !fromPubkey || !targetPubkey || !rec.admins.has(fromPubkey)) return false;
+        roomBans.get(channelId)?.delete(targetPubkey);
+        rec.admins.add(targetPubkey);
+        if (rec.creator === fromPubkey) {
+          rec.creator = targetPubkey;
+        }
+        if (targetPubkey !== fromPubkey) {
+          rec.admins.delete(fromPubkey);
+        }
         return true;
       },
       revokeRoomAdmin(channelId, targetPubkey) {
@@ -964,17 +996,22 @@ export async function createDecLocServer(userOpts = {}) {
           store.initRoomCreator(channelId, ev.pubkey);
         }
         const grantTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'd_admin_grant' && isHex64(t[1]));
+        const transferTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'd_admin_transfer' && isHex64(t[1]));
         const revokeTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'd_admin_revoke' && isHex64(t[1]));
         const banTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'd_admin_ban' && isHex64(t[1]));
         const unbanTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'd_admin_unban' && isHex64(t[1]));
         const nukeTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'd_room_nuke');
 
-        if (grantTag || revokeTag || banTag || unbanTag || nukeTag) {
+        if (grantTag || transferTag || revokeTag || banTag || unbanTag || nukeTag) {
           if (!store.isRoomAdmin(channelId, ev.pubkey)) {
             wsSendText(client.socket, JSON.stringify(['OK', ev.id, false, 'blocked: admin privilege required']));
             return;
           }
-          if (grantTag) store.grantRoomAdmin(channelId, grantTag[1].toLowerCase());
+          if (transferTag) {
+            store.transferRoomAdmin(channelId, ev.pubkey, transferTag[1].toLowerCase());
+          } else if (grantTag) {
+            store.grantRoomAdmin(channelId, grantTag[1].toLowerCase());
+          }
           if (revokeTag) {
             const target = revokeTag[1].toLowerCase();
             if (store.isRoomCreator(channelId, target)) {
