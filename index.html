@@ -101,6 +101,13 @@
         </div>
         <div class="row-gap-sm">
           <button id="lockAppBtn" type="button" class="icon-btn hidden" data-i18n-title="lockAppTitle" aria-label="Lock app">🔒</button>
+          <button id="notifyBtn" type="button" class="icon-btn notify-btn" data-i18n-title="notifyBtnEnable" aria-label="Notifications">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+              <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+            </svg>
+            <span id="notifyBtnDot" class="notify-btn-dot"></span>
+          </button>
           <button id="infoBtn" type="button" class="icon-btn" data-i18n-title="infoTitle" aria-label="Info & Guide">
             <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="10"/>
@@ -171,6 +178,7 @@
                   <span class="dot dot-ok"></span>
                   <span id="onlineCountText">1 online</span>
                 </button>
+                <button id="myHandleBtn" type="button" class="my-handle-pill" data-i18n-title="myHandleTooltip"></button>
                 <span id="activeRoomRelayBadge" class="room-relay-badge"></span>
               </div>
             </div>
@@ -261,6 +269,16 @@
                 <line x1="1" y1="1" x2="23" y2="23"/>
               </svg>
             </button>
+            <button id="flipCamBtn" type="button" class="call-ctrl-btn hidden" data-i18n-title="flipCamBtn" aria-label="Switch camera">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M11 19H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"/>
+                <path d="M13 5h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-5"/>
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M18 22l-3-3 3-3"/>
+                <path d="M6 2l3 3-3 3"/>
+              </svg>
+            </button>
+            <select id="callCameraSelect" class="call-cam-select hidden" data-i18n-title="selectCameraLabel" aria-label="Select camera"></select>
             <button id="hangupBtn" type="button" class="call-ctrl-btn call-ctrl-btn-danger" data-i18n-title="hangupBtn" aria-label="Hang up">
               <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
                 <path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08a.956.956 0 0 1-.29-.7c0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28a11.27 11.27 0 0 0-2.67-1.85.996.996 0 0 1-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/>
@@ -550,19 +568,33 @@
         </div>
 
         <div class="settings-group">
-          <h4 data-i18n="notifySection">Teavitused</h4>
+          <h4 data-i18n="notifySection">Notifications</h4>
           <label class="checkbox-row">
             <input id="settingsSoundCheck" type="checkbox">
-            <span data-i18n="soundLabel">Heliteavitus</span>
+            <span data-i18n="soundLabel">Sound & vibration</span>
           </label>
           <label class="checkbox-row">
             <input id="settingsNotifyCheck" type="checkbox">
-            <span data-i18n="browserNotifyLabel">Brauseri teavitused</span>
+            <span data-i18n="browserNotifyLabel">OS notifications</span>
           </label>
           <label class="checkbox-row">
             <input id="settingsReadReceiptsCheck" type="checkbox">
-            <span data-i18n="readReceiptsLabel">Saada lugemiskinnitusi („Nähtud“)</span>
+            <span data-i18n="readReceiptsLabel">Send read receipts ("Seen")</span>
           </label>
+          <div id="webPushStatusText" class="hint-text hidden"></div>
+          <div class="row-gap">
+            <button id="testNotifyBtn" type="button" class="btn btn-secondary btn-sm" data-i18n="testNotifyBtn">Test sound & alert</button>
+          </div>
+          <div class="divider"></div>
+          <label class="field">
+            <span data-i18n="ntfyLabel">Optional ntfy.sh push URL</span>
+            <div class="input-with-btn">
+              <input id="settingsNtfyUrlInput" type="text" autocomplete="off" class="mono-input" data-i18n-placeholder="ntfyPlaceholder">
+              <button id="genNtfyBtn" type="button" class="btn btn-secondary btn-sm" data-i18n="generateBtn">Generate</button>
+              <button id="testNtfyBtn" type="button" class="btn btn-secondary btn-sm" data-i18n="testNtfyBtn">Test</button>
+            </div>
+          </label>
+          <p class="hint-text" data-i18n="ntfyHint"></p>
         </div>
 
         <div class="settings-group">
@@ -572,6 +604,29 @@
             <input id="settingsGiphyKeyInput" type="text" autocomplete="off" class="mono-input" data-i18n-placeholder="giphyKeyPlaceholder">
           </label>
           <p class="hint-text" data-i18n="giphyKeyHint"></p>
+        </div>
+
+        <div class="settings-group">
+          <details class="info-box">
+            <summary data-i18n="turnSectionTitle">Video/Voice Calls: optional TURN server (for strict 4G/5G NAT)</summary>
+            <div class="stack" style="margin-top: 8px;">
+              <label class="field">
+                <span data-i18n="turnUrlLabel">TURN URL</span>
+                <input id="settingsTurnUrlInput" type="text" autocomplete="off" class="mono-input" data-i18n-placeholder="turnUrlPlaceholder">
+              </label>
+              <div class="grid-2">
+                <label class="field">
+                  <span data-i18n="turnUserLabel">Username</span>
+                  <input id="settingsTurnUserInput" type="text" autocomplete="off" class="mono-input">
+                </label>
+                <label class="field">
+                  <span data-i18n="turnPassLabel">Credential / Password</span>
+                  <input id="settingsTurnPassInput" type="password" autocomplete="off" class="mono-input">
+                </label>
+              </div>
+              <p class="hint-text" data-i18n="turnHint"></p>
+            </div>
+          </details>
         </div>
 
         <div class="settings-group">
@@ -613,6 +668,36 @@
         <button type="button" class="icon-btn modal-close" data-close-modal="seenModal">✕</button>
       </div>
       <div id="seenList" class="online-list"></div>
+    </div>
+  </div>
+
+  <!-- User Identity & Verified Name-History Chain ("Plokiahel") Modal -->
+  <div id="userHistoryModal" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal card">
+      <div class="modal-header">
+        <h3 data-i18n="userHistoryTitle">User identity & name history</h3>
+        <button type="button" class="icon-btn modal-close" data-close-modal="userHistoryModal">✕</button>
+      </div>
+      <div class="stack">
+        <div class="user-history-head">
+          <div id="userHistoryAvatar" class="online-avatar user-history-avatar"></div>
+          <div class="user-history-meta">
+            <div id="userHistoryHandle" class="user-history-handle"></div>
+            <div id="userHistoryStatus" class="user-history-status"></div>
+          </div>
+        </div>
+        <div class="cred-box">
+          <div class="cred-row">
+            <span class="muted small" data-i18n="userHistoryRoomKey">Permanent room key (unchangeable)</span>
+            <strong id="userHistoryPubkey" class="mono-input"></strong>
+          </div>
+        </div>
+        <div class="field">
+          <span data-i18n="userHistoryChainTitle">Verified name chain</span>
+          <div id="userHistoryChainList" class="chain-timeline settings-scroll"></div>
+        </div>
+        <p class="hint-text" data-i18n="userHistoryNote"></p>
+      </div>
     </div>
   </div>
 

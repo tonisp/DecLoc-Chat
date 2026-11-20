@@ -22,9 +22,12 @@ export const CONFIG = {
   SITE_PASSCODE_SHA256: null,
 
   // STUN servers for optional P2P WebRTC voice & video calls inside rooms
+  // (includes port 443 STUN for restrictive Wi-Fi/corporate firewalls; optional TURN can be set here or in Settings)
   ICE_SERVERS: [
     { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:stun.nextcloud.com:443' },
   ],
 
   // Nostr event kinds:

@@ -11,6 +11,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { verifyNostrEvent } from '../js/crypto.js';
+import { loadOrCreateVapidKeys, sendWebPush } from './webpush.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -360,13 +361,167 @@ export async function createDecLocServer(userOpts = {}) {
   };
 
   const store = await createEventStore(opts.dataDir);
+  const vapidKeys = loadOrCreateVapidKeys(opts.dataDir);
+  const pushSender = typeof opts.sendPushFn === 'function' ? opts.sendPushFn : sendWebPush;
+  const pushSubsPath = path.join(opts.dataDir, 'push-subs.json');
+  const pushSubs = new Map(); // endpoint -> { subscription, channels: Set, senderPubkeys: Set }
+
+  if (fs.existsSync(pushSubsPath)) {
+    try {
+      const saved = JSON.parse(fs.readFileSync(pushSubsPath, 'utf8'));
+      if (Array.isArray(saved)) {
+        for (const item of saved) {
+          if (item?.subscription?.endpoint) {
+            pushSubs.set(item.subscription.endpoint, {
+              subscription: item.subscription,
+              channels: new Set(Array.isArray(item.channels) ? item.channels : []),
+              senderPubkeys: new Set(Array.isArray(item.senderPubkeys) ? item.senderPubkeys : []),
+            });
+          }
+        }
+      }
+    } catch {
+      // ignore corrupted push-subs.json
+    }
+  }
+
+  function persistPushSubs() {
+    try {
+      const arr = [...pushSubs.values()].map((s) => ({
+        subscription: s.subscription,
+        channels: [...s.channels],
+        senderPubkeys: [...s.senderPubkeys],
+      }));
+      const tmp = pushSubsPath + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(arr, null, 2), { mode: 0o600 });
+      fs.renameSync(tmp, pushSubsPath);
+    } catch {
+      // ignore disk errors
+    }
+  }
+
+  function readJsonBody(req, maxBytes = 8192) {
+    return new Promise((resolve, reject) => {
+      let total = 0;
+      const chunks = [];
+      req.on('data', (c) => {
+        total += c.length;
+        if (total > maxBytes) {
+          reject(new Error('Body too large'));
+          req.destroy();
+          return;
+        }
+        chunks.push(c);
+      });
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        } catch {
+          reject(new Error('Invalid JSON'));
+        }
+      });
+      req.on('error', reject);
+    });
+  }
+
+  async function dispatchWebPushForEvent(ev) {
+    if (pushSubs.size === 0) return;
+    const notifyTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'p_notify');
+    if (!notifyTag) return;
+    const eTag = ev.tags.find((t) => Array.isArray(t) && t[0] === 'e' && typeof t[1] === 'string');
+    if (!eTag) return;
+
+    const channelId = eTag[1];
+    const isCall = notifyTag[1] === 'call';
+    const payload = {
+      title: 'DecLoc Chat',
+      body: isCall ? 'Incoming voice/video call' : 'New encrypted message',
+      channelId,
+      type: isCall ? 'call' : 'msg',
+    };
+
+    let removedAny = false;
+    const tasks = [];
+    for (const [endpoint, subRec] of pushSubs.entries()) {
+      if (!subRec.channels.has(channelId)) continue;
+      if (subRec.senderPubkeys.has(ev.pubkey)) continue; // never push the sender themselves
+      tasks.push(
+        Promise.resolve()
+          .then(() => pushSender(subRec.subscription, payload, vapidKeys, { urgency: 'high' }))
+          .then((res) => {
+            if (res && res.gone) {
+              pushSubs.delete(endpoint);
+              removedAny = true;
+            }
+          })
+          .catch(() => {})
+      );
+    }
+    if (tasks.length > 0) {
+      await Promise.all(tasks);
+      if (removedAny) persistPushSubs();
+    }
+  }
+
   const clients = new Set();
   const startedAt = Date.now();
   const MAX_FRAME_BYTES = Math.max(opts.maxEventBytes * 2, 131072);
 
-  const server = http.createServer((req, res) => {
+  const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', 'http://localhost');
     const accept = String(req.headers.accept || '');
+
+    // Web Push Subscription API (VAPID)
+    if (req.method === 'POST' && url.pathname === '/api/push/subscribe') {
+      try {
+        const body = await readJsonBody(req);
+        const sub = body?.subscription;
+        if (
+          !sub ||
+          typeof sub.endpoint !== 'string' ||
+          !sub.endpoint.startsWith('https://') ||
+          !sub.keys?.p256dh ||
+          !sub.keys?.auth
+        ) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Invalid subscription' }));
+          return;
+        }
+        const channels = Array.isArray(body.channels)
+          ? body.channels.filter((x) => typeof x === 'string' && /^[0-9a-f]{64}$/i.test(x)).slice(0, 100)
+          : [];
+        const senderPubkeys = Array.isArray(body.senderPubkeys)
+          ? body.senderPubkeys.filter((x) => typeof x === 'string' && /^[0-9a-f]{64}$/i.test(x)).slice(0, 100)
+          : [];
+        pushSubs.set(sub.endpoint, {
+          subscription: sub,
+          channels: new Set(channels),
+          senderPubkeys: new Set(senderPubkeys),
+        });
+        persistPushSubs();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/push/unsubscribe') {
+      try {
+        const body = await readJsonBody(req);
+        if (typeof body?.endpoint === 'string' && pushSubs.delete(body.endpoint)) {
+          persistPushSubs();
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false }));
+      }
+      return;
+    }
 
     // NIP-11 Relay Information Document
     if (accept.includes('application/nostr+json') && (url.pathname === '/' || url.pathname === '/relay')) {
@@ -386,7 +541,7 @@ export async function createDecLocServer(userOpts = {}) {
       return;
     }
 
-    // Auto-discovery endpoint so DecLoc Chat frontend hosted here uses this relay automatically
+    // Auto-discovery endpoint so DecLoc Chat frontend hosted here uses this relay + Web Push automatically
     if (url.pathname === '/decloc-relay.json') {
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
@@ -397,6 +552,7 @@ export async function createDecLocServer(userOpts = {}) {
           selfHostedRelay: true,
           wsPath: '/relay',
           storage: store.backend,
+          vapidPublicKey: vapidKeys.publicKey,
         })
       );
       return;
@@ -671,6 +827,9 @@ export async function createDecLocServer(userOpts = {}) {
           }
         }
       }
+
+      // Trigger background Web Push wake-up for sleeping/closed mobile devices (fire-and-forget)
+      dispatchWebPushForEvent(ev).catch(() => {});
     }
   }
 

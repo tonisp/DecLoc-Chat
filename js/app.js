@@ -18,6 +18,11 @@ import {
   encodeInviteUrl,
   decodeInviteHash,
   shortFingerprint,
+  isValidHandleTag,
+  deriveHandleTag,
+  resolveUniqueHandleTag,
+  formatUserHandle,
+  computeNameBlockHash,
   colorFromPubkey,
 } from './crypto.js';
 import {
@@ -35,6 +40,20 @@ import {
 import { RelayPool } from './nostr.js';
 import { CallManager } from './webrtc.js';
 import { EMOJI_CATEGORIES, searchEmojis } from './emojis.js';
+import {
+  initAudioUnlock,
+  playMessageSound,
+  startCallRingtone,
+  stopCallRingtone,
+  vibrateDevice,
+  updateUnreadBadges,
+  stopTitleFlash,
+  requestNotificationPermission,
+  showOsNotification,
+  syncServerWebPush,
+  normalizeNtfyUrl,
+  sendNtfyPing,
+} from './notify.js';
 
 const REACT_EMOJIS = ['👍', '❤️', '😂', '🎉'];
 
@@ -53,9 +72,10 @@ let pendingInvite = null;
 let lastTypingSentAt = 0;
 let invitePassVisible = false;
 let selfHostedRelayUrl = null;
+let selfHostedVapidKey = null;
+let webPushActive = false;
 let activeMasterSeed = settings.masterSeed || null;
 const appBootSec = Math.floor(Date.now() / 1000);
-let audioCtx = null;
 
 // Picker & Video Call UI state
 let pickerTab = 'emoji'; // 'emoji' | 'gif'
@@ -63,6 +83,8 @@ let activeEmojiCat = 'smileys';
 let pickerReactTargetMsgId = null;
 let gifSearchTimer = null;
 let readReceiptTimer = null;
+const membershipAnchorTimers = new Map();
+const callMediaElCache = new Map(); // `${key}:${kind}` -> HTMLMediaElement (reused to prevent Safari/Firefox black video!)
 let callLayout = 'compact'; // 'compact' | 'grid' | 'split' | 'spotlight'
 let pinnedCallPeer = null; // 'local' | remotePubkey | null
 let cachedReadmeText = null;
@@ -92,7 +114,10 @@ async function detectSelfHostedRelay() {
     if (data && data.selfHostedRelay === true) {
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsPath = typeof data.wsPath === 'string' ? data.wsPath : '/relay';
-      return `${proto}//${window.location.host}${wsPath}`;
+      return {
+        wsUrl: `${proto}//${window.location.host}${wsPath}`,
+        vapidPublicKey: typeof data.vapidPublicKey === 'string' ? data.vapidPublicKey : null,
+      };
     }
   } catch {
     // Running statically (e.g. GitHub Pages) without local relay
@@ -103,6 +128,7 @@ async function detectSelfHostedRelay() {
 // --- Boot ---
 
 async function init() {
+  initAudioUnlock();
   applyTheme();
   applyI18n();
   setupEmojiPopover();
@@ -114,6 +140,11 @@ async function init() {
 
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
+    navigator.serviceWorker.addEventListener('message', (evt) => {
+      if (evt.data?.type === 'OPEN_ROOM' && evt.data.channelId && roomsState.has(evt.data.channelId)) {
+        selectRoom(evt.data.channelId);
+      }
+    });
   }
 
   // Capture any #join=... invite from URL immediately and strip hash from bar
@@ -182,8 +213,11 @@ async function startApp() {
   $('appTitle').textContent = CONFIG.APP_NAME;
   $('lockAppBtn').classList.toggle('hidden', !settings.deviceLockEnabled);
 
-  // Auto-discover built-in relay when hosted via relay/server.mjs (Termux / self-hosted)
-  selfHostedRelayUrl = await detectSelfHostedRelay();
+  // Auto-discover built-in relay & VAPID Web Push when hosted via relay/server.mjs
+  const selfInfo = await detectSelfHostedRelay();
+  selfHostedRelayUrl = selfInfo?.wsUrl || null;
+  selfHostedVapidKey = selfInfo?.vapidPublicKey || null;
+  renderNotifyButtonState();
 
   // Load saved rooms and derive keys
   const savedRooms = await getAllRooms();
@@ -201,6 +235,9 @@ async function startApp() {
   callManager = new CallManager({
     sendSignal: sendRoomEphemeral,
     onStateChange: renderCallUI,
+    getIceServers: getConfiguredIceServers,
+    onResumeMedia: resumeAllCallMedia,
+    onNotice: (key) => showToast(t(key), 4500),
   });
 
   // Auto-join pending invite link if user opened one
@@ -246,8 +283,9 @@ async function hydrateRoom(room) {
   const reactMap = new Map();
   const deletedTargets = new Map(); // targetId -> Set(issuerPubkey)
   const verifiedDeletedIds = new Set();
+  const archiveEvents = new Map(); // pubkey -> { id, pubkey, lastTag, reservedTags, archivedAtMs, createdAt }
 
-  // Pass 1: load deletion tombstones first so deleted messages cannot reappear
+  // Pass 1: load deletion tombstones AND member archive records first so deleted/archived data cannot reappear
   for (const item of stored) {
     if (item.type === 'del' && Array.isArray(item.targets) && typeof item.pubkey === 'string') {
       for (const tid of item.targets) {
@@ -258,14 +296,36 @@ async function hydrateRoom(room) {
         }
         issuers.add(item.pubkey);
       }
+    } else if (item.type === 'archive' && typeof item.pubkey === 'string' && isValidHandleTag(item.lastTag)) {
+      const archivedAtMs = typeof item.archivedAtMs === 'number' ? item.archivedAtMs : (item.createdAt || 0) * 1000;
+      const prev = archiveEvents.get(item.pubkey);
+      if (!prev || archivedAtMs >= prev.archivedAtMs) {
+        const reserved = Array.isArray(item.reservedTags)
+          ? [...new Set([item.lastTag, ...item.reservedTags.filter(isValidHandleTag)])].slice(0, 20)
+          : [item.lastTag];
+        archiveEvents.set(item.pubkey, {
+          id: item.id,
+          pubkey: item.pubkey,
+          lastTag: item.lastTag,
+          reservedTags: reserved,
+          archivedAtMs,
+          createdAt: item.createdAt || Math.floor(archivedAtMs / 1000),
+        });
+      }
     }
   }
 
-  // Pass 2: load non-deleted messages and purge any leftover zombie messages
+  const isPreArchive = (pubkey, tsMs) => {
+    const arch = archiveEvents.get(pubkey);
+    return Boolean(arch && tsMs <= arch.archivedAtMs);
+  };
+
+  // Pass 2: load non-deleted, non-archived messages and purge any leftover zombie copies
   const purgeIds = [];
   for (const item of stored) {
     if (item.type === 'msg' || !item.type) {
-      if (deletedTargets.get(item.id)?.has(item.pubkey)) {
+      const tsMs = typeof item.tsMs === 'number' ? item.tsMs : (item.createdAt || 0) * 1000;
+      if (deletedTargets.get(item.id)?.has(item.pubkey) || isPreArchive(item.pubkey, tsMs)) {
         verifiedDeletedIds.add(item.id);
         purgeIds.push(item.id);
       } else {
@@ -274,19 +334,32 @@ async function hydrateRoom(room) {
     }
   }
 
-  // Pass 3: load reactions and read receipts for remaining messages
+  // Pass 3: load reactions, read receipts, and signed name-change blocks (scrubbing pre-archive entries)
   const readReceipts = new Map(); // pubkey -> { msgId, msgTs, name, seenAtMs }
+  const nickEvents = new Map(); // evId -> { id, pubkey, name, prevName, seq, prevHash, tsMs, createdAt }
   let lastSentReadMsgId = null;
 
   for (const item of stored) {
     if (item.type === 'react') {
-      if (verifiedDeletedIds.has(item.target)) {
+      const tsMs = typeof item.tsMs === 'number' ? item.tsMs : (item.createdAt || 0) * 1000;
+      if (verifiedDeletedIds.has(item.target) || isPreArchive(item.pubkey, tsMs)) {
         purgeIds.push(item.id);
       } else {
         applyReactionInMemory(reactMap, item);
       }
+    } else if (item.type === 'nick' && typeof item.pubkey === 'string' && typeof item.name === 'string') {
+      const tsMs = typeof item.tsMs === 'number' ? item.tsMs : (item.createdAt || 0) * 1000;
+      if (isPreArchive(item.pubkey, tsMs)) {
+        purgeIds.push(item.id);
+      } else {
+        nickEvents.set(item.id, item);
+      }
     } else if (item.type === 'read' && typeof item.pubkey === 'string' && typeof item.msgId === 'string') {
       const seenAtMs = typeof item.seenAtMs === 'number' ? item.seenAtMs : (item.createdAt || 0) * 1000;
+      if (isPreArchive(item.pubkey, seenAtMs)) {
+        purgeIds.push(item.id);
+        continue;
+      }
       const prev = readReceipts.get(item.pubkey);
       if (!prev || seenAtMs >= prev.seenAtMs) {
         readReceipts.set(item.pubkey, {
@@ -313,12 +386,24 @@ async function hydrateRoom(room) {
     messages: msgMap,
     reactions: reactMap,
     readReceipts,
+    nickEvents,
+    archiveEvents,
+    members: new Map(), // pubkey -> { pubkey, name, isOnline, lastActiveMs, firstSeenMs }
+    archivedMembers: new Map(), // pubkey -> { pubkey, lastTag, reservedTags, archivedAtMs }
+    archivedTags: new Set(), // retired tags (released FIFO only if tag space saturates)
+    archivedFifoQueue: [], // oldest-first FIFO queue of archived tags
+    activeTags: new Set(), // tags held by currently active members
+    claimedTags: new Set(), // all tags currently active or archived in this room
+    resolvedTags: new Map(), // `${pubkey}:${normName}` -> unique tag
+    nameChains: new Map(), // pubkey -> Array<verifiedBlock>
+    ownMetaEventIds: new Set(), // own kind:42 nick/read/react event IDs for clean NIP-09 wipe on archive
     lastSentReadMsgId,
     deletedTargets,
     verifiedDeletedIds,
     presence: new Map(),
     typing: new Map(),
   };
+  rebuildRoomDirectory(state);
   recomputeRoomPreview(state);
   roomsState.set(secrets.channelId, state);
   return state;
@@ -381,6 +466,518 @@ function syncSubscriptions() {
 
   pool.setChannelRoutes(routes, keepAlive);
   handleRelayStatusChange();
+  syncPushRegistration();
+}
+
+async function syncPushRegistration() {
+  if (!selfHostedVapidKey) return;
+  const selfRooms = [...roomsState.values()].filter(
+    (s) => s.room.relayMode === 'custom' && s.room.customRelay === selfHostedRelayUrl
+  );
+  const channels = selfRooms.map((s) => s.room.channelId);
+  const senderPubkeys = selfRooms.map((s) => s.identity.pubkeyHex);
+  const enabled = settings.notifications && 'Notification' in window && Notification.permission === 'granted';
+  webPushActive = await syncServerWebPush({
+    vapidPublicKey: selfHostedVapidKey,
+    enabled,
+    channels,
+    senderPubkeys,
+  });
+  renderWebPushStatus();
+}
+
+function renderNotifyButtonState() {
+  const btn = $('notifyBtn');
+  if (!btn) return;
+  const active = settings.notifications && 'Notification' in window && Notification.permission === 'granted';
+  btn.classList.toggle('notify-on', active);
+  const label = active ? t('notifyBtnActive') : t('notifyBtnEnable');
+  btn.title = label;
+  btn.setAttribute('aria-label', label);
+}
+
+function renderWebPushStatus() {
+  const el = $('webPushStatusText');
+  if (!el) return;
+  if (!selfHostedVapidKey) {
+    el.classList.add('hidden');
+    return;
+  }
+  el.classList.remove('hidden');
+  el.textContent = webPushActive ? t('webPushActiveStatus') : t('webPushReadyStatus');
+}
+
+function normalizeHandleName(name) {
+  return String(name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function isBlockedByArchive(state, pubkey, tsMs) {
+  const arch = state?.archiveEvents?.get(pubkey);
+  return Boolean(arch && Number(tsMs || 0) <= arch.archivedAtMs);
+}
+
+// Lookup (or deterministically derive) a room-unique tag with FIFO archive recycle + auto-expand (4 -> 5 -> 6...)
+function getRoomTag(state, pubkey, displayName) {
+  if (!state || !pubkey) return '';
+  const norm = normalizeHandleName(displayName);
+  const key = `${pubkey}:${norm}`;
+  const existing = state.resolvedTags?.get(key);
+  if (existing) return existing;
+  return resolveUniqueHandleTag(pubkey, state.room.channelId, displayName, state.claimedTags || null, {
+    archivedFifoQueue: state.archivedFifoQueue ? [...state.archivedFifoQueue] : null,
+    activeTagsSet: state.activeTags || null,
+  });
+}
+
+function getRoomHandle(state, displayName, pubkey) {
+  const clean = String(displayName || '?').trim().slice(0, 32) || '?';
+  if (!state || !pubkey) return clean;
+  return `${clean}-${getRoomTag(state, pubkey, clean)}`;
+}
+
+function renderMyRoomHandle(state) {
+  const btn = $('myHandleBtn');
+  if (!btn || !state) return;
+  const handle = getRoomHandle(state, settings.name, state.identity.pubkeyHex);
+  btn.textContent = `👤 ${handle}`;
+  btn.title = t('myHandleTooltip');
+}
+
+// Reconstruct the entire room directory in one deterministic pass:
+// 1) Permanently reserves all archived tags (never reusable in this room!)
+// 2) Assigns non-colliding chronological 4-char tags for every (pubkey, name)
+// 3) Rebuilds every user's verified name-change hash-chain ("plokiahel")
+// 4) Builds persistent Members (online + offline) AND Archived Members (archived-xxxx, zero names)
+function rebuildRoomDirectory(state) {
+  const channelId = state.room.channelId;
+  const myPubkey = state.identity.pubkeyHex;
+
+  const archivedTags = new Set();
+  const archivedFifoQueue = []; // oldest-first FIFO order for economical recycling if space ever saturates
+  const archivedOwnerByTag = new Map(); // tag -> archived pubkey
+  const recycledArchivePubkeys = new Set(); // archived records whose lastTag was recycled via FIFO
+  const activeTags = new Set();
+  const claimedTags = new Set();
+  const resolvedTags = new Map(); // `${pubkey}:${normName}` -> tag
+  const nameChains = new Map();
+  const members = new Map();
+  const archivedMembers = new Map();
+
+  // 1. Seed archived tags in deterministic FIFO order (oldest archived first; older historical tags before lastTag)
+  const sortedArchives = [...state.archiveEvents.values()].sort(
+    (a, b) => (a.archivedAtMs || 0) - (b.archivedAtMs || 0) || String(a.id || '').localeCompare(String(b.id || ''))
+  );
+  for (const arch of sortedArchives) {
+    const olderTags = (arch.reservedTags || []).filter((tg) => tg !== arch.lastTag);
+    const orderedTags = [...olderTags, arch.lastTag];
+    for (const tg of orderedTags) {
+      if (isValidHandleTag(tg) && !archivedTags.has(tg)) {
+        archivedTags.add(tg);
+        claimedTags.add(tg);
+        archivedFifoQueue.push(tg);
+        archivedOwnerByTag.set(tg, arch.pubkey);
+      }
+    }
+  }
+
+  // 2. Gather ALL non-archived nick & msg events room-wide in deterministic chronological order
+  const allCandidates = [];
+  for (const ev of state.nickEvents.values()) {
+    const cleanName = String(ev.name || '').trim().slice(0, 32);
+    const ts = typeof ev.tsMs === 'number' ? ev.tsMs : (ev.createdAt || 0) * 1000;
+    if (!cleanName || isBlockedByArchive(state, ev.pubkey, ts)) continue;
+    allCandidates.push({
+      id: ev.id,
+      pubkey: ev.pubkey,
+      source: 'nick',
+      name: cleanName,
+      prevName: typeof ev.prevName === 'string' ? ev.prevName.trim().slice(0, 32) : null,
+      seq: Number(ev.seq || 0),
+      prevHash: typeof ev.prevHash === 'string' ? ev.prevHash : null,
+      ts,
+    });
+  }
+  for (const m of state.messages.values()) {
+    const cleanName = String(m.name || '').trim().slice(0, 32);
+    const ts = typeof m.tsMs === 'number' ? m.tsMs : (m.createdAt || 0) * 1000;
+    if (!cleanName || isBlockedByArchive(state, m.pubkey, ts)) continue;
+    allCandidates.push({
+      id: m.id,
+      pubkey: m.pubkey,
+      source: 'msg',
+      name: cleanName,
+      prevName: null,
+      seq: 0,
+      prevHash: null,
+      ts,
+    });
+  }
+
+  allCandidates.sort((a, b) => {
+    if (a.ts !== b.ts) return a.ts - b.ts;
+    if (a.source !== b.source) return a.source === 'nick' ? -1 : 1;
+    if (a.seq !== b.seq) return a.seq - b.seq;
+    return String(a.id).localeCompare(String(b.id));
+  });
+
+  const claimTagFor = (pubkey, name) => {
+    const norm = normalizeHandleName(name);
+    const key = `${pubkey}:${norm}`;
+    const existing = resolvedTags.get(key);
+    if (existing) return existing;
+    const tag = resolveUniqueHandleTag(pubkey, channelId, name, claimedTags, {
+      archivedFifoQueue,
+      activeTagsSet: activeTags,
+      onRecycle: (recycledTag) => {
+        archivedTags.delete(recycledTag);
+        const ownerPk = archivedOwnerByTag.get(recycledTag);
+        if (ownerPk) {
+          const ownerArch = state.archiveEvents.get(ownerPk);
+          if (ownerArch && ownerArch.lastTag === recycledTag) {
+            recycledArchivePubkeys.add(ownerPk);
+          }
+        }
+      },
+    });
+    resolvedTags.set(key, tag);
+    claimedTags.add(tag);
+    activeTags.add(tag);
+    return tag;
+  };
+
+  for (const item of allCandidates) {
+    const pubkey = item.pubkey;
+    const tag = claimTagFor(pubkey, item.name);
+    const handle = `${item.name}-${tag}`;
+
+    let chain = nameChains.get(pubkey);
+    if (!chain) {
+      chain = [];
+      nameChains.set(pubkey, chain);
+    }
+    const prevBlock = chain.length > 0 ? chain[chain.length - 1] : null;
+
+    if (prevBlock && prevBlock.name === item.name) {
+      if (prevBlock.source === 'msg' && item.source === 'nick') {
+        const beforePrev = chain.length > 1 ? chain[chain.length - 2] : null;
+        const effectiveSeq = item.seq > 0 ? item.seq : prevBlock.seq;
+        const effectivePrevHash = item.prevHash || (beforePrev ? beforePrev.blockHash : 'GENESIS');
+        const blockHash = computeNameBlockHash({
+          channelId,
+          pubkey,
+          seq: effectiveSeq,
+          name: item.name,
+          tag,
+          prevHash: effectivePrevHash,
+          ts: item.ts,
+        });
+        const chainLinked = beforePrev
+          ? effectivePrevHash === beforePrev.blockHash
+          : effectivePrevHash === 'GENESIS';
+        chain[chain.length - 1] = {
+          id: item.id,
+          seq: effectiveSeq,
+          name: item.name,
+          tag,
+          handle,
+          prevName: beforePrev ? beforePrev.name : null,
+          prevHash: effectivePrevHash,
+          blockHash,
+          ts: item.ts,
+          source: 'nick',
+          chainLinked,
+        };
+      }
+      continue;
+    }
+
+    const effectiveSeq = item.source === 'nick' && item.seq > 0 ? item.seq : (prevBlock ? prevBlock.seq + 1 : 1);
+    const effectivePrevHash =
+      item.source === 'nick' && item.prevHash
+        ? item.prevHash
+        : prevBlock
+          ? prevBlock.blockHash
+          : 'GENESIS';
+    const blockHash = computeNameBlockHash({
+      channelId,
+      pubkey,
+      seq: effectiveSeq,
+      name: item.name,
+      tag,
+      prevHash: effectivePrevHash,
+      ts: item.ts,
+    });
+    const chainLinked = prevBlock
+      ? effectivePrevHash === prevBlock.blockHash
+      : effectivePrevHash === 'GENESIS';
+
+    chain.push({
+      id: item.id,
+      seq: effectiveSeq,
+      name: item.name,
+      tag,
+      handle,
+      prevName: prevBlock ? prevBlock.name : null,
+      prevHash: effectivePrevHash,
+      blockHash,
+      ts: item.ts,
+      source: item.source,
+      chainLinked,
+    });
+  }
+
+  // 3. Build persistent active Members directory (Online + Offline)
+  const myChain = nameChains.get(myPubkey) || [];
+  const myName = settings.name || (myChain.length > 0 ? myChain[myChain.length - 1].name : '?');
+  claimTagFor(myPubkey, myName);
+  members.set(myPubkey, {
+    pubkey: myPubkey,
+    name: myName,
+    isOnline: true,
+    isMe: true,
+    lastActiveMs: Date.now(),
+    firstSeenMs: myChain.length > 0 ? myChain[0].ts : Date.now(),
+  });
+
+  // All peers known from persisted nameChains (messages or nick/join blocks) — visible even when Offline!
+  for (const [pk, chain] of nameChains.entries()) {
+    if (pk === myPubkey || chain.length === 0) continue;
+    const latest = chain[chain.length - 1];
+    const pres = state.presence.get(pk);
+    const receipt = state.readReceipts.get(pk);
+    const name = pres?.name || latest.name;
+    claimTagFor(pk, name);
+    members.set(pk, {
+      pubkey: pk,
+      name,
+      isOnline: Boolean(pres),
+      isMe: false,
+      lastActiveMs: Math.max(latest.ts, pres?.ts || 0, receipt?.seenAtMs || 0),
+      firstSeenMs: chain[0].ts,
+    });
+  }
+
+  // Any peers currently online via live presence (before their nick block arrives)
+  for (const [pk, pres] of state.presence.entries()) {
+    if (pk === myPubkey || members.has(pk) || isBlockedByArchive(state, pk, pres.ts)) continue;
+    claimTagFor(pk, pres.name);
+    members.set(pk, {
+      pubkey: pk,
+      name: pres.name,
+      isOnline: true,
+      isMe: false,
+      lastActiveMs: pres.ts,
+      firstSeenMs: pres.ts,
+    });
+  }
+
+  // Any peers known via non-archived read receipts
+  for (const [pk, rcpt] of state.readReceipts.entries()) {
+    if (pk === myPubkey || members.has(pk) || isBlockedByArchive(state, pk, rcpt.seenAtMs)) continue;
+    claimTagFor(pk, rcpt.name);
+    members.set(pk, {
+      pubkey: pk,
+      name: rcpt.name,
+      isOnline: false,
+      isMe: false,
+      lastActiveMs: rcpt.seenAtMs,
+      firstSeenMs: rcpt.seenAtMs,
+    });
+  }
+
+  // 4. Archived members (departed & data-erased): ONLY show those not currently active or FIFO-recycled
+  for (const [pk, arch] of state.archiveEvents.entries()) {
+    if (!members.has(pk) && !recycledArchivePubkeys.has(pk)) {
+      archivedMembers.set(pk, arch);
+    }
+  }
+
+  state.archivedTags = archivedTags;
+  state.archivedFifoQueue = archivedFifoQueue;
+  state.activeTags = activeTags;
+  state.claimedTags = claimedTags;
+  state.resolvedTags = resolvedTags;
+  state.nameChains = nameChains;
+  state.members = members;
+  state.archivedMembers = archivedMembers;
+}
+
+function rebuildNameChainForPubkey(state, pubkey) {
+  rebuildRoomDirectory(state);
+  return state.nameChains.get(pubkey) || [];
+}
+
+async function applyArchiveInRoom(state, archiveItem) {
+  const prev = state.archiveEvents.get(archiveItem.pubkey);
+  if (prev && prev.archivedAtMs >= archiveItem.archivedAtMs) return false;
+
+  state.archiveEvents.set(archiveItem.pubkey, archiveItem);
+
+  const scrubIds = [];
+  const pk = archiveItem.pubkey;
+  const cutoff = archiveItem.archivedAtMs;
+
+  // Scrub all pre-archive messages authored by pk
+  for (const [id, m] of [...state.messages.entries()]) {
+    const ts = typeof m.tsMs === 'number' ? m.tsMs : (m.createdAt || 0) * 1000;
+    if (m.pubkey === pk && ts <= cutoff) {
+      state.messages.delete(id);
+      state.reactions.delete(id);
+      state.verifiedDeletedIds.add(id);
+      scrubIds.push(id);
+      if (replyTarget && replyTarget.id === id) {
+        replyTarget = null;
+        renderReplyBar();
+      }
+    }
+  }
+
+  // Scrub all pre-archive nick/name blocks authored by pk (removes their display name everywhere!)
+  for (const [id, n] of [...state.nickEvents.entries()]) {
+    const ts = typeof n.tsMs === 'number' ? n.tsMs : (n.createdAt || 0) * 1000;
+    if (n.pubkey === pk && ts <= cutoff) {
+      state.nickEvents.delete(id);
+      scrubIds.push(id);
+    }
+  }
+
+  // Scrub pre-archive read receipts & ephemeral states
+  const rcpt = state.readReceipts.get(pk);
+  if (rcpt && rcpt.seenAtMs <= cutoff) {
+    state.readReceipts.delete(pk);
+    scrubIds.push(`read:${state.room.channelId}:${pk}`);
+  }
+  const pres = state.presence.get(pk);
+  if (pres && pres.ts <= cutoff) state.presence.delete(pk);
+  const typ = state.typing.get(pk);
+  if (typ && typ.ts <= cutoff) state.typing.delete(pk);
+
+  // Remove pk's reactions from other messages in memory
+  for (const byEmoji of state.reactions.values()) {
+    for (const byUser of byEmoji.values()) {
+      byUser.delete(pk);
+    }
+  }
+
+  await saveMessage(archiveItem);
+  if (scrubIds.length > 0) {
+    await deleteMessagesByIds(scrubIds);
+  }
+
+  rebuildRoomDirectory(state);
+  recomputeRoomPreview(state);
+  await saveRoom(state.room);
+  return true;
+}
+
+function scheduleMembershipAnchor(state) {
+  if (!state) return;
+  const chId = state.room.channelId;
+  clearTimeout(membershipAnchorTimers.get(chId));
+  const timer = setTimeout(async () => {
+    membershipAnchorTimers.delete(chId);
+    const curr = roomsState.get(chId);
+    if (!curr || !pool || !settings.name) return;
+    const myPubkey = curr.identity.pubkeyHex;
+    const chain = curr.nameChains.get(myPubkey) || [];
+    const hasMyNickBlock = [...curr.nickEvents.values()].some(
+      (n) => n.pubkey === myPubkey && !isBlockedByArchive(curr, myPubkey, typeof n.tsMs === 'number' ? n.tsMs : n.createdAt * 1000)
+    );
+    if (!hasMyNickBlock || (chain.length > 0 && chain[chain.length - 1].name !== settings.name)) {
+      await publishNickBlock(curr, settings.name);
+      if (chId === activeChannelId) {
+        renderMyRoomHandle(curr);
+        renderOnlineCount();
+      }
+    }
+  }, 1500);
+  membershipAnchorTimers.set(chId, timer);
+}
+
+async function publishNickBlock(state, newName, prevNameIfEmpty = null) {
+  const cleanNew = String(newName || '').trim().slice(0, 32);
+  if (!state || !cleanNew) return null;
+
+  const myPubkey = state.identity.pubkeyHex;
+  let chain = rebuildNameChainForPubkey(state, myPubkey);
+
+  // If renaming before sending any messages in this room, anchor the original name first as block #1
+  const cleanPrevInit = String(prevNameIfEmpty || '').trim().slice(0, 32);
+  if (chain.length === 0 && cleanPrevInit && cleanPrevInit !== cleanNew) {
+    await publishNickBlock(state, cleanPrevInit, null);
+    chain = rebuildNameChainForPubkey(state, myPubkey);
+  }
+
+  const prevBlock = chain.length > 0 ? chain[chain.length - 1] : null;
+  if (prevBlock && prevBlock.name === cleanNew && prevBlock.source === 'nick') return prevBlock;
+
+  const seq = prevBlock ? prevBlock.seq + 1 : 1;
+  const prevHash = prevBlock ? prevBlock.blockHash : 'GENESIS';
+  const prevName = prevBlock && prevBlock.name !== cleanNew ? prevBlock.name : null;
+  const archCutoff = state.archiveEvents.get(myPubkey)?.archivedAtMs || 0;
+  const ts = Math.max(Date.now(), prevBlock ? prevBlock.ts + 1 : 0, archCutoff + 1);
+
+  const payload = {
+    v: 1,
+    t: 'nick',
+    name: cleanNew,
+    prevName,
+    seq,
+    prevHash,
+    ts,
+  };
+
+  const content = await encryptRoomPayload(
+    state.aesKey,
+    myPubkey,
+    state.room.channelId,
+    payload
+  );
+
+  const ev = await signNostrEvent(
+    {
+      kind: CONFIG.MSG_KIND,
+      tags: [['e', state.room.channelId, '', 'root']],
+      content,
+    },
+    state.identity.privKeyBytes
+  );
+
+  const nickItem = {
+    id: ev.id,
+    channelId: state.room.channelId,
+    type: 'nick',
+    pubkey: myPubkey,
+    name: cleanNew,
+    prevName,
+    seq,
+    prevHash,
+    tsMs: ts,
+    createdAt: ev.created_at,
+  };
+
+  state.nickEvents.set(nickItem.id, nickItem);
+  rebuildRoomDirectory(state);
+  await saveMessage(nickItem);
+  if (pool) pool.publish(ev, getRoomRelays(state.room));
+  return nickItem;
+}
+
+async function broadcastNameChangeAcrossRooms(prevName, newName) {
+  const cleanPrev = String(prevName || '').trim().slice(0, 32);
+  const cleanNew = String(newName || '').trim().slice(0, 32);
+  if (!cleanNew || cleanPrev === cleanNew) return;
+  for (const state of roomsState.values()) {
+    await publishNickBlock(state, cleanNew, cleanPrev);
+  }
+  if (activeChannelId) {
+    const activeState = roomsState.get(activeChannelId);
+    if (activeState) {
+      renderMyRoomHandle(activeState);
+      renderMessages(false);
+      renderOnlineCount();
+    }
+  }
 }
 
 function renderActiveRoomRelayBadge(room) {
@@ -419,6 +1016,7 @@ function selectRoom(channelId) {
   $('appShell').classList.add('mobile-chat-open');
 
   $('activeRoomName').textContent = state.room.name;
+  renderMyRoomHandle(state);
   renderActiveRoomRelayBadge(state.room);
   handleRelayStatusChange();
   renderRoomList();
@@ -430,6 +1028,7 @@ function selectRoom(channelId) {
 
   announcePresence(channelId, 'online');
   scheduleReadReceipt(state);
+  scheduleMembershipAnchor(state);
   if (window.innerWidth > 768) {
     $('messageInput').focus();
   }
@@ -495,6 +1094,7 @@ async function sendReadReceiptIfNeeded(state) {
     },
     state.identity.privKeyBytes
   );
+  state.ownMetaEventIds.add(ev.id);
 
   await saveMessage({
     id: `read:${state.room.channelId}:${state.identity.pubkeyHex}`,
@@ -532,6 +1132,9 @@ async function sendTextMessage(text, gifObj = null) {
     : null;
   if (!trimmed && !validGif) return;
 
+  // Ensure current handle is anchored in this room's verified name chain
+  await publishNickBlock(state, settings.name);
+
   const payload = {
     v: 1,
     t: 'msg',
@@ -561,7 +1164,10 @@ async function sendTextMessage(text, gifObj = null) {
   const ev = await signNostrEvent(
     {
       kind: CONFIG.MSG_KIND,
-      tags: [['e', state.room.channelId, '', 'root']],
+      tags: [
+        ['e', state.room.channelId, '', 'root'],
+        ['p_notify', '1'],
+      ],
       content,
     },
     state.identity.privKeyBytes
@@ -577,13 +1183,15 @@ async function sendTextMessage(text, gifObj = null) {
     gif: validGif,
     replyTo: payload.replyTo || null,
     createdAt: ev.created_at,
+    tsMs: payload.ts,
     ackCount: 0,
   };
 
   state.messages.set(msgObj.id, msgObj);
+  rebuildRoomDirectory(state);
   state.room.lastActivity = msgObj.createdAt;
   state.room.lastReadAt = msgObj.createdAt;
-  state.room.lastPreview = `${msgObj.name}: ${msgObj.text || '[GIF]'}`;
+  state.room.lastPreview = `${getRoomHandle(state, msgObj.name, msgObj.pubkey)}: ${msgObj.text || '[GIF]'}`;
   await saveMessage(msgObj);
   await saveRoom(state.room);
 
@@ -595,6 +1203,9 @@ async function sendTextMessage(text, gifObj = null) {
   const sentTo = pool ? pool.publish(ev, getRoomRelays(state.room)) : 0;
   if (sentTo === 0) {
     showToast(t('errNoRelays'));
+  }
+  if (settings.ntfyUrl) {
+    sendNtfyPing(settings.ntfyUrl, { isCall: false, title: CONFIG.APP_NAME }).catch(() => {});
   }
 }
 
@@ -663,7 +1274,7 @@ function recomputeRoomPreview(state) {
   }
   if (latest) {
     state.room.lastActivity = latest.createdAt;
-    state.room.lastPreview = `${latest.name}: ${latest.text || '[GIF]'}`;
+    state.room.lastPreview = `${getRoomHandle(state, latest.name, latest.pubkey)}: ${latest.text || '[GIF]'}`;
   } else {
     state.room.lastPreview = '';
   }
@@ -787,15 +1398,22 @@ async function sendRoomEphemeral(channelId, payloadObj) {
     channelId,
     { v: 1, ...payloadObj, ts: Date.now() }
   );
+  const tags = [['e', channelId]];
+  if (payloadObj.t === 'rtc_join') {
+    tags.push(['p_notify', 'call']);
+  }
   const ev = await signNostrEvent(
     {
       kind: CONFIG.EPHEMERAL_KIND,
-      tags: [['e', channelId]],
+      tags,
       content,
     },
     state.identity.privKeyBytes
   );
   pool.publish(ev, getRoomRelays(state.room));
+  if (payloadObj.t === 'rtc_join' && settings.ntfyUrl) {
+    sendNtfyPing(settings.ntfyUrl, { isCall: true, title: CONFIG.APP_NAME }).catch(() => {});
+  }
 }
 
 function announcePresence(channelId, status = 'online') {
@@ -833,37 +1451,99 @@ async function handleIncomingNostrEvent(ev, fromRelayUrl) {
   if (ev.kind === CONFIG.EPHEMERAL_KIND) {
     if (payload.t === 'presence') {
       if (ev.pubkey === state.identity.pubkeyHex) return;
+      const nowMs = Date.now();
+      if (isBlockedByArchive(state, ev.pubkey, nowMs)) return;
       if (payload.status === 'leave') {
         state.presence.delete(ev.pubkey);
       } else {
         state.presence.set(ev.pubkey, {
           name: String(payload.name || '?').slice(0, 32),
-          ts: Date.now(),
+          ts: nowMs,
         });
       }
-      if (channelId === activeChannelId) renderOnlineCount();
+      rebuildRoomDirectory(state);
+      if (channelId === activeChannelId) {
+        renderOnlineCount();
+        if (!$('onlineModal').classList.contains('hidden')) openOnlineModal();
+      }
       return;
     }
 
     if (payload.t === 'typing') {
       if (ev.pubkey === state.identity.pubkeyHex) return;
+      const nowMs = Date.now();
+      if (isBlockedByArchive(state, ev.pubkey, nowMs)) return;
       state.typing.set(ev.pubkey, {
         name: String(payload.name || '?').slice(0, 32),
-        ts: Date.now(),
+        ts: nowMs,
       });
       if (channelId === activeChannelId) renderTypingBar();
       return;
     }
 
     if (payload.t.startsWith('rtc_') && callManager) {
+      const isIncomingCallStart =
+        payload.t === 'rtc_join' &&
+        ev.pubkey !== state.identity.pubkeyHex &&
+        callManager.activeChannelId !== channelId;
       await callManager.handleSignal(channelId, ev.pubkey, payload);
+      if (isIncomingCallStart) {
+        const callerName = String(payload.name || '?').slice(0, 32);
+        const callerHandle = getRoomHandle(state, callerName, ev.pubkey);
+        startCallRingtone(settings.sound);
+        if (settings.notifications) {
+          showOsNotification({
+            title: state.room.name,
+            body: t('incomingCallNotif', callerHandle),
+            tag: `decloc-call-${channelId}`,
+            channelId,
+            requireInteraction: true,
+            onClick: () => selectRoom(channelId),
+          });
+        }
+        updateUnreadBadges(getTotalUnreadCount() || 1, CONFIG.APP_NAME, `📞 ${callerHandle} (${state.room.name})`);
+      } else if (payload.t === 'rtc_leave' && callManager.getRoomCallParticipants(channelId).length === 0) {
+        stopCallRingtone();
+      }
       return;
     }
     return;
   }
 
-  // --- Persisted channel messages, reactions & deletions (kind 42) ---
+  // --- Persisted channel messages, reactions, deletions & member archives (kind 42) ---
   if (ev.kind !== CONFIG.MSG_KIND) return;
+
+  if (payload.t === 'archive') {
+    const rawLast = isValidHandleTag(payload.lastTag)
+      ? payload.lastTag
+      : deriveHandleTag(ev.pubkey, channelId, '');
+    const reserved = Array.isArray(payload.reservedTags)
+      ? [...new Set([rawLast, ...payload.reservedTags.filter(isValidHandleTag)])].slice(0, 20)
+      : [rawLast];
+    const archivedAtMs = typeof payload.ts === 'number' ? payload.ts : ev.created_at * 1000;
+    const archiveItem = {
+      id: ev.id,
+      channelId,
+      type: 'archive',
+      pubkey: ev.pubkey,
+      lastTag: rawLast,
+      reservedTags: reserved,
+      archivedAtMs,
+      createdAt: ev.created_at,
+    };
+    const changed = await applyArchiveInRoom(state, archiveItem);
+    if (changed) {
+      if (channelId === activeChannelId) {
+        renderMessages(false);
+        renderOnlineCount();
+        renderTypingBar();
+        if (!$('onlineModal').classList.contains('hidden')) openOnlineModal();
+      }
+      renderRoomList();
+      updateTabTitle();
+    }
+    return;
+  }
 
   if (payload.t === 'del' && Array.isArray(payload.targets)) {
     const targets = payload.targets
@@ -891,6 +1571,8 @@ async function handleIncomingNostrEvent(ev, fromRelayUrl) {
 
   if (payload.t === 'react' && typeof payload.target === 'string' && typeof payload.emoji === 'string') {
     if (state.verifiedDeletedIds.has(payload.target)) return;
+    const reactTs = typeof payload.ts === 'number' ? payload.ts : ev.created_at * 1000;
+    if (isBlockedByArchive(state, ev.pubkey, reactTs)) return;
     const reactItem = {
       id: ev.id,
       channelId,
@@ -900,7 +1582,7 @@ async function handleIncomingNostrEvent(ev, fromRelayUrl) {
       emoji: payload.emoji.slice(0, 8),
       remove: Boolean(payload.remove),
       createdAt: ev.created_at,
-      tsMs: typeof payload.ts === 'number' ? payload.ts : ev.created_at * 1000,
+      tsMs: reactTs,
     };
     applyReactionInMemory(state.reactions, reactItem);
     await saveMessage(reactItem);
@@ -910,6 +1592,7 @@ async function handleIncomingNostrEvent(ev, fromRelayUrl) {
 
   if (payload.t === 'read' && typeof payload.msgId === 'string') {
     const seenAtMs = typeof payload.ts === 'number' ? payload.ts : ev.created_at * 1000;
+    if (isBlockedByArchive(state, ev.pubkey, seenAtMs)) return;
     const msgTs = typeof payload.msgTs === 'number' ? payload.msgTs : ev.created_at;
     const name = String(payload.name || '?').slice(0, 32);
     const prev = state.readReceipts.get(ev.pubkey);
@@ -934,15 +1617,49 @@ async function handleIncomingNostrEvent(ev, fromRelayUrl) {
         seenAtMs,
         createdAt: ev.created_at,
       });
-      if (channelId === activeChannelId) renderMessages(false);
+      rebuildRoomDirectory(state);
+      if (channelId === activeChannelId) {
+        renderMessages(false);
+        renderOnlineCount();
+      }
+    }
+    return;
+  }
+
+  if (payload.t === 'nick' && typeof payload.name === 'string') {
+    const cleanName = payload.name.trim().slice(0, 32);
+    if (!cleanName) return;
+    if (state.nickEvents.has(ev.id)) return;
+    const tsMs = typeof payload.ts === 'number' ? payload.ts : ev.created_at * 1000;
+    if (isBlockedByArchive(state, ev.pubkey, tsMs)) return;
+    const nickItem = {
+      id: ev.id,
+      channelId,
+      type: 'nick',
+      pubkey: ev.pubkey,
+      name: cleanName,
+      prevName: typeof payload.prevName === 'string' ? payload.prevName.trim().slice(0, 32) : null,
+      seq: Number(payload.seq || 1),
+      prevHash: typeof payload.prevHash === 'string' ? payload.prevHash.slice(0, 128) : 'GENESIS',
+      tsMs,
+      createdAt: ev.created_at,
+    };
+    state.nickEvents.set(nickItem.id, nickItem);
+    rebuildRoomDirectory(state);
+    await saveMessage(nickItem);
+    if (channelId === activeChannelId) {
+      renderMessages(false);
+      renderOnlineCount();
+      if (!$('onlineModal').classList.contains('hidden')) openOnlineModal();
     }
     return;
   }
 
   if (payload.t === 'msg' && (typeof payload.text === 'string' || (payload.gif && isSafeHttpsUrl(payload.gif.url)))) {
     if (state.messages.has(ev.id)) return;
-    // Drop zombie copies from relays that ignored NIP-09 deletion
-    if (isDeletedForAuthor(state, ev.id, ev.pubkey)) {
+    const msgTsMs = typeof payload.ts === 'number' ? payload.ts : ev.created_at * 1000;
+    // Drop zombie copies from relays that ignored NIP-09 deletion or from archived departed users
+    if (isDeletedForAuthor(state, ev.id, ev.pubkey) || isBlockedByArchive(state, ev.pubkey, msgTsMs)) {
       state.verifiedDeletedIds.add(ev.id);
       return;
     }
@@ -968,18 +1685,21 @@ async function handleIncomingNostrEvent(ev, fromRelayUrl) {
           }
         : null,
       createdAt: ev.created_at,
+      tsMs: msgTsMs,
       ackCount: 1,
     };
 
     state.messages.set(msgObj.id, msgObj);
+    rebuildRoomDirectory(state);
+    const msgHandle = getRoomHandle(state, msgObj.name, msgObj.pubkey);
     state.typing.delete(ev.pubkey);
 
     if (msgObj.createdAt >= (state.room.lastActivity || 0)) {
       state.room.lastActivity = msgObj.createdAt;
-      state.room.lastPreview = `${msgObj.name}: ${msgObj.text || '[GIF]'}`;
+      state.room.lastPreview = `${msgHandle}: ${msgObj.text || '[GIF]'}`;
     }
 
-    const isViewingRoom = channelId === activeChannelId && !document.hidden;
+    const isViewingRoom = channelId === activeChannelId && !document.hidden && document.hasFocus();
     if (isViewingRoom) {
       state.room.lastReadAt = Math.max(state.room.lastReadAt || 0, msgObj.createdAt);
     }
@@ -996,29 +1716,30 @@ async function handleIncomingNostrEvent(ev, fromRelayUrl) {
       const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 150;
       renderMessages(nearBottom || isOwn);
       renderTypingBar();
+      renderOnlineCount();
     }
     renderRoomList();
-    updateTabTitle();
 
     // Notify only for genuinely live incoming messages from others
     const isLive = ev.created_at >= appBootSec - 5;
     if (!isOwn && isLive) {
-      if (settings.sound) playSoftChime();
-      if (document.hidden && settings.notifications && 'Notification' in window && Notification.permission === 'granted') {
-        try {
-          const notif = new Notification(`${state.room.name} — ${msgObj.name}`, {
-            body: msgObj.text.slice(0, 140),
-            icon: './icon.svg',
-            tag: channelId,
-          });
-          notif.onclick = () => {
-            window.focus();
-            selectRoom(channelId);
-          };
-        } catch {
-          // ignore
-        }
+      const needsAttention = document.hidden || !document.hasFocus() || channelId !== activeChannelId;
+      if (settings.sound) {
+        playMessageSound();
+        vibrateDevice([200, 100, 200]);
       }
+      if (needsAttention && settings.notifications) {
+        showOsNotification({
+          title: `${state.room.name} — ${msgHandle}`,
+          body: msgObj.text || '[GIF]',
+          tag: `decloc-${channelId}`,
+          channelId,
+          onClick: () => selectRoom(channelId),
+        });
+      }
+      updateTabTitle(`💬 ${msgHandle}: ${state.room.name}`);
+    } else {
+      updateTabTitle();
     }
   }
 }
@@ -1147,12 +1868,15 @@ function pruneEphemeralStates() {
   const now = Date.now();
   let activeChanged = false;
   for (const [chId, state] of roomsState.entries()) {
+    let presenceChanged = false;
     for (const [pk, info] of state.presence.entries()) {
       if (now - info.ts > 50000) {
         state.presence.delete(pk);
+        presenceChanged = true;
         if (chId === activeChannelId) activeChanged = true;
       }
     }
+    if (presenceChanged) rebuildRoomDirectory(state);
     for (const [pk, info] of state.typing.entries()) {
       if (now - info.ts > 4500) {
         state.typing.delete(pk);
@@ -1163,6 +1887,7 @@ function pruneEphemeralStates() {
   if (activeChanged) {
     renderOnlineCount();
     renderTypingBar();
+    if (!$('onlineModal').classList.contains('hidden')) openOnlineModal();
   }
 }
 
@@ -1179,12 +1904,16 @@ function getUnreadCount(state) {
   return count;
 }
 
-function updateTabTitle() {
+function getTotalUnreadCount() {
   let totalUnread = 0;
   for (const state of roomsState.values()) {
     totalUnread += getUnreadCount(state);
   }
-  document.title = totalUnread > 0 ? `(${totalUnread}) ${CONFIG.APP_NAME}` : CONFIG.APP_NAME;
+  return totalUnread;
+}
+
+function updateTabTitle(flashMsg = '') {
+  updateUnreadBadges(getTotalUnreadCount(), CONFIG.APP_NAME, flashMsg);
 }
 
 function renderRoomList() {
@@ -1261,8 +1990,20 @@ function renderMessages(scrollToBottom) {
   const msgs = [...state.messages.values()].sort(
     (a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id)
   );
+  const renames = [...state.nickEvents.values()]
+    .filter((n) => n.prevName && n.prevName !== n.name)
+    .map((n) => ({ ...n, _kind: 'nick', _tsMs: typeof n.tsMs === 'number' ? n.tsMs : n.createdAt * 1000 }));
 
-  if (msgs.length === 0) {
+  const timeline = [
+    ...msgs.map((m) => ({
+      ...m,
+      _kind: 'msg',
+      _tsMs: typeof m.tsMs === 'number' ? m.tsMs : m.createdAt * 1000,
+    })),
+    ...renames,
+  ].sort((a, b) => a._tsMs - b._tsMs || (a._kind === b._kind ? a.id.localeCompare(b.id) : a._kind === 'nick' ? -1 : 1));
+
+  if (timeline.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'history-empty';
     empty.textContent = t('historyEmpty');
@@ -1303,8 +2044,8 @@ function renderMessages(scrollToBottom) {
   let prevPubkey = '';
   let prevTs = 0;
 
-  for (const m of msgs) {
-    const ms = m.createdAt * 1000;
+  for (const entry of timeline) {
+    const ms = entry._tsMs;
     const dayKey = new Date(ms).toDateString();
     if (dayKey !== prevDay) {
       const divider = document.createElement('div');
@@ -1315,6 +2056,24 @@ function renderMessages(scrollToBottom) {
       prevPubkey = '';
     }
 
+    if (entry._kind === 'nick') {
+      prevPubkey = '';
+      const oldHandle = getRoomHandle(state, entry.prevName, entry.pubkey);
+      const newHandle = getRoomHandle(state, entry.name, entry.pubkey);
+      const nickRow = document.createElement('div');
+      nickRow.className = 'nick-change-row';
+      const pill = document.createElement('button');
+      pill.type = 'button';
+      pill.className = 'nick-change-pill';
+      pill.title = t('clickForHistoryHint');
+      pill.textContent = `⛓ ${t('nickChangedInline', oldHandle, newHandle)} · ${formatClock(ms)}`;
+      pill.addEventListener('click', () => openUserHistoryModal(state.room.channelId, entry.pubkey));
+      nickRow.appendChild(pill);
+      list.appendChild(nickRow);
+      continue;
+    }
+
+    const m = entry;
     const isOwn = m.pubkey === state.identity.pubkeyHex;
     const grouped = m.pubkey === prevPubkey && m.createdAt - prevTs < 180;
     prevPubkey = m.pubkey;
@@ -1327,14 +2086,32 @@ function renderMessages(scrollToBottom) {
     if (!grouped && !isOwn) {
       const author = document.createElement('div');
       author.className = 'msg-author';
+      const authorBtn = document.createElement('button');
+      authorBtn.type = 'button';
+      authorBtn.className = 'msg-author-btn';
+      authorBtn.title = t('clickForHistoryHint');
+      authorBtn.addEventListener('click', () => openUserHistoryModal(state.room.channelId, m.pubkey));
+
       const nameSpan = document.createElement('span');
       nameSpan.className = 'msg-author-name';
       nameSpan.style.color = colorFromPubkey(m.pubkey);
       nameSpan.textContent = m.name;
-      const fpSpan = document.createElement('span');
-      fpSpan.className = 'msg-author-fp';
-      fpSpan.textContent = shortFingerprint(m.pubkey);
-      author.append(nameSpan, fpSpan);
+
+      const tagSpan = document.createElement('span');
+      tagSpan.className = 'msg-author-tag';
+      tagSpan.textContent = `-${getRoomTag(state, m.pubkey, m.name)}`;
+
+      authorBtn.append(nameSpan, tagSpan);
+
+      const userChain = state.nameChains.get(m.pubkey);
+      if (userChain && userChain.length > 1) {
+        const chainBadge = document.createElement('span');
+        chainBadge.className = 'msg-author-chain-badge';
+        chainBadge.textContent = `⛓ ${userChain.length}`;
+        authorBtn.appendChild(chainBadge);
+      }
+
+      author.appendChild(authorBtn);
       row.appendChild(author);
     }
 
@@ -1345,7 +2122,9 @@ function renderMessages(scrollToBottom) {
     bubble.className = 'msg-bubble';
 
     if (m.replyTo) {
+      const archivedAuthor = m.replyTo.pubkey ? state.archivedMembers.get(m.replyTo.pubkey) : null;
       const quoteDeleted =
+        Boolean(archivedAuthor) ||
         state.verifiedDeletedIds.has(m.replyTo.id) ||
         (m.replyTo.pubkey && isDeletedForAuthor(state, m.replyTo.id, m.replyTo.pubkey));
       const quote = document.createElement('div');
@@ -1355,7 +2134,11 @@ function renderMessages(scrollToBottom) {
       }
       const qAuthor = document.createElement('span');
       qAuthor.className = 'msg-reply-quote-author';
-      qAuthor.textContent = m.replyTo.name;
+      qAuthor.textContent = archivedAuthor
+        ? `archived-${archivedAuthor.lastTag}`
+        : m.replyTo.pubkey
+          ? getRoomHandle(state, m.replyTo.name, m.replyTo.pubkey)
+          : m.replyTo.name;
       const qText = document.createElement('span');
       qText.className = 'msg-reply-quote-text' + (quoteDeleted ? ' msg-reply-deleted' : '');
       qText.textContent = quoteDeleted ? t('deletedQuoteText') : m.replyTo.text;
@@ -1502,7 +2285,7 @@ function renderMessages(scrollToBottom) {
 
       const summary = viewers
         .slice(0, 2)
-        .map((v) => `${v.name} ${formatSeenTime(v.seenAtMs)}`)
+        .map((v) => `${getRoomHandle(state, v.name, v.pubkey)} ${formatSeenTime(v.seenAtMs)}`)
         .join(', ');
       const extra = viewers.length > 2 ? ` +${viewers.length - 2}` : '';
       const txt = document.createElement('span');
@@ -1558,8 +2341,12 @@ function jumpToMessage(msgId) {
 function renderOnlineCount() {
   const state = roomsState.get(activeChannelId);
   if (!state) return;
-  const count = 1 + state.presence.size;
-  $('onlineCountText').textContent = t('onlineCount', count);
+  let online = 0;
+  for (const m of state.members.values()) {
+    if (m.isOnline) online++;
+  }
+  const total = Math.max(state.members.size, 1);
+  $('onlineCountText').textContent = t('onlineCount', Math.max(online, 1), total);
 }
 
 function renderTypingBar() {
@@ -1569,7 +2356,9 @@ function renderTypingBar() {
     bar.classList.add('hidden');
     return;
   }
-  const names = [...state.typing.values()].map((x) => x.name);
+  const names = [...state.typing.entries()].map(([pk, x]) =>
+    getRoomHandle(state, x.name, pk)
+  );
   bar.textContent =
     names.length === 1
       ? t('typingOne', names[0])
@@ -1585,12 +2374,37 @@ function renderReplyBar() {
     bar.classList.add('hidden');
     return;
   }
-  $('replyBarAuthor').textContent = t('replyingTo', replyTarget.name);
+  const st = activeChannelId ? roomsState.get(activeChannelId) : null;
+  const displayAuthor =
+    replyTarget.pubkey && st
+      ? getRoomHandle(st, replyTarget.name, replyTarget.pubkey)
+      : replyTarget.name;
+  $('replyBarAuthor').textContent = t('replyingTo', displayAuthor);
   $('replyBarText').textContent = replyTarget.text;
   bar.classList.remove('hidden');
 }
 
 // --- WebRTC Call UI (Compact, Grid, Split 50/50, Spotlight + PiP) ---
+
+function getConfiguredIceServers() {
+  const servers = [...CONFIG.ICE_SERVERS];
+  const rawTurn = String(settings.turnUrl || '').trim();
+  if (rawTurn && /^(turns?|stuns?):/i.test(rawTurn)) {
+    const entry = { urls: rawTurn };
+    if (settings.turnUser) entry.username = settings.turnUser;
+    if (settings.turnPass) entry.credential = settings.turnPass;
+    servers.push(entry);
+  }
+  return servers;
+}
+
+function resumeAllCallMedia() {
+  for (const el of callMediaElCache.values()) {
+    if (el.srcObject && typeof el.play === 'function') {
+      el.play().catch(() => {});
+    }
+  }
+}
 
 function setCallLayout(nextLayout) {
   if (!['compact', 'grid', 'split', 'spotlight'].includes(nextLayout)) return;
@@ -1612,9 +2426,12 @@ function renderCallUI(activeCall) {
   }
 
   // Show incoming call banner if peers in this room are on a call and we aren't
+  const activeState = roomsState.get(activeChannelId);
   const roomCallers = callManager ? callManager.getRoomCallParticipants(activeChannelId) : [];
   if (!activeCall && roomCallers.length > 0) {
-    const names = roomCallers.map((p) => p.name).join(', ');
+    const names = roomCallers
+      .map((p) => (activeState ? getRoomHandle(activeState, p.name, p.pubkey) : formatUserHandle(p.name, p.pubkey, activeChannelId)))
+      .join(', ');
     $('callBannerText').textContent = t('callBanner', names);
     banner.classList.remove('hidden');
   } else {
@@ -1623,6 +2440,12 @@ function renderCallUI(activeCall) {
 
   if (!activeCall || activeCall.channelId !== activeChannelId) {
     panel.classList.add('hidden');
+    if (!activeCall) {
+      for (const el of callMediaElCache.values()) {
+        el.srcObject = null;
+      }
+      callMediaElCache.clear();
+    }
     if (document.fullscreenElement === panel) {
       document.exitFullscreen().catch(() => {});
     }
@@ -1659,28 +2482,77 @@ function renderCallUI(activeCall) {
   camBtn.classList.toggle('is-off', !activeCall.videoEnabled);
   $('camOnIcon').classList.toggle('hidden', !activeCall.videoEnabled);
   $('camOffIcon').classList.toggle('hidden', activeCall.videoEnabled);
+  $('flipCamBtn').classList.toggle('hidden', !activeCall.videoEnabled);
 
+  // Render camera selector dropdown whenever 2+ cameras are available during video call
+  const camSelect = $('callCameraSelect');
+  const usableCams = (activeCall.cameras || []).filter((c) => Boolean(c.deviceId));
+  if (activeCall.videoEnabled && usableCams.length > 1) {
+    const sig = usableCams.map((c) => `${c.deviceId}:${c.label}`).join('|');
+    if (camSelect.dataset.camSig !== sig) {
+      camSelect.textContent = '';
+      usableCams.forEach((c, idx) => {
+        const opt = document.createElement('option');
+        opt.value = c.deviceId;
+        if (c.label) {
+          opt.textContent = c.label;
+        } else if (c.facing === 'user') {
+          opt.textContent = t('cameraFrontLabel');
+        } else if (c.facing === 'environment') {
+          opt.textContent = t('cameraBackLabel');
+        } else {
+          opt.textContent = t('cameraGenericLabel', idx + 1);
+        }
+        camSelect.appendChild(opt);
+      });
+      camSelect.dataset.camSig = sig;
+    }
+    if (activeCall.activeVideoDeviceId && usableCams.some((c) => c.deviceId === activeCall.activeVideoDeviceId)) {
+      camSelect.value = activeCall.activeVideoDeviceId;
+    }
+    camSelect.classList.remove('hidden');
+  } else {
+    camSelect.classList.add('hidden');
+  }
+
+  const myRoomPk = activeState?.identity.pubkeyHex || '0000';
   const localTileData = {
     key: 'local',
-    name: `${settings.name} (${t('youTag')})`,
-    pubkey: roomsState.get(activeChannelId)?.identity.pubkeyHex || '0000',
+    name: `${activeState ? getRoomHandle(activeState, settings.name, myRoomPk) : formatUserHandle(settings.name, myRoomPk, activeChannelId)} (${t('youTag')})`,
+    pubkey: myRoomPk,
     stream: activeCall.localStream,
     muted: true,
     isLocal: true,
+    mirror: activeCall.facingMode !== 'environment',
     audioMuted: activeCall.audioMuted,
     hasVideo: activeCall.videoEnabled,
+    connState: 'connected',
   };
 
   const remoteTilesData = activeCall.remotePeers.map((peer) => ({
     key: peer.pubkey,
-    name: peer.name,
+    name: activeState ? getRoomHandle(activeState, peer.name, peer.pubkey) : formatUserHandle(peer.name, peer.pubkey, activeChannelId),
     pubkey: peer.pubkey,
     stream: peer.stream,
     muted: false,
     isLocal: false,
+    mirror: false,
     audioMuted: Boolean(peer.audioMuted),
     hasVideo: Boolean(peer.videoEnabled),
+    connState: peer.state || 'connecting',
   }));
+
+  // Prune stale cached media elements for peers who left the call
+  const validKeys = new Set(remoteTilesData.map((p) => p.key));
+  validKeys.add('local');
+  for (const cacheKey of [...callMediaElCache.keys()]) {
+    const peerKey = cacheKey.slice(0, cacheKey.lastIndexOf(':'));
+    if (!validKeys.has(peerKey)) {
+      const stale = callMediaElCache.get(cacheKey);
+      if (stale) stale.srcObject = null;
+      callMediaElCache.delete(cacheKey);
+    }
+  }
 
   const allTiles = [localTileData, ...remoteTilesData];
 
@@ -1806,18 +2678,36 @@ function renderCallUI(activeCall) {
   }
 }
 
-function buildMediaTile({ name, pubkey, stream, muted, isLocal, audioMuted, hasVideo }, onClick) {
+function buildMediaTile({ key, name, pubkey, stream, muted, isLocal, mirror, audioMuted, hasVideo, connState }, onClick) {
   const tile = document.createElement('div');
-  tile.className = 'media-tile' + (isLocal ? ' is-local' : '');
+  tile.className = 'media-tile' + (isLocal && mirror !== false ? ' is-local' : '');
   tile.title = t('callTapToFocus');
   if (onClick) tile.addEventListener('click', onClick);
 
-  const media = document.createElement(hasVideo ? 'video' : 'audio');
-  media.autoplay = true;
-  media.playsInline = true;
+  const cacheKey = `${key || pubkey}:${hasVideo ? 'v' : 'a'}`;
+  let media = callMediaElCache.get(cacheKey);
+  if (!media) {
+    media = document.createElement(hasVideo ? 'video' : 'audio');
+    media.autoplay = true;
+    media.playsInline = true;
+    media.setAttribute('autoplay', '');
+    media.setAttribute('playsinline', '');
+    media.setAttribute('webkit-playsinline', '');
+    media.muted = muted;
+    if (muted) media.setAttribute('muted', '');
+    media.addEventListener('loadedmetadata', () => {
+      media.play().catch(() => {});
+    });
+    callMediaElCache.set(cacheKey, media);
+  }
   media.muted = muted;
-  media.srcObject = stream;
+  if (media.srcObject !== stream) {
+    media.srcObject = stream;
+  }
   tile.appendChild(media);
+  if (stream && typeof media.play === 'function') {
+    media.play().catch(() => {});
+  }
 
   if (!hasVideo) {
     const av = document.createElement('div');
@@ -1825,6 +2715,18 @@ function buildMediaTile({ name, pubkey, stream, muted, isLocal, audioMuted, hasV
     av.style.background = colorFromPubkey(pubkey);
     av.textContent = (name[0] || '?').toUpperCase();
     tile.appendChild(av);
+  }
+
+  if (!isLocal && connState && connState !== 'connected') {
+    const stBadge = document.createElement('span');
+    stBadge.className = 'media-tile-conn' + (connState === 'failed' ? ' is-failed' : '');
+    stBadge.textContent =
+      connState === 'failed'
+        ? t('callStateFailed')
+        : connState === 'reconnecting'
+          ? t('callStateReconnecting')
+          : t('callStateConnecting');
+    tile.appendChild(stBadge);
   }
 
   if (audioMuted) {
@@ -1844,6 +2746,7 @@ function buildMediaTile({ name, pubkey, stream, muted, isLocal, audioMuted, hasV
 async function startRoomCall(withVideo) {
   const state = roomsState.get(activeChannelId);
   if (!state || !callManager) return;
+  stopCallRingtone();
   try {
     callLayout = withVideo ? 'spotlight' : 'compact';
     pinnedCallPeer = null;
@@ -2052,24 +2955,150 @@ async function loadGiphyGifs(query = '') {
 function openSeenModal(viewers) {
   const list = $('seenList');
   list.textContent = '';
+  const st = activeChannelId ? roomsState.get(activeChannelId) : null;
   for (const v of viewers) {
-    const item = document.createElement('div');
-    item.className = 'online-row';
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'online-row online-row-btn';
+    item.title = t('clickForHistoryHint');
+    item.addEventListener('click', () => {
+      hideOverlay('seenModal');
+      if (activeChannelId) openUserHistoryModal(activeChannelId, v.pubkey);
+    });
     const av = document.createElement('div');
     av.className = 'online-avatar';
     av.style.background = colorFromPubkey(v.pubkey);
     av.textContent = (v.name[0] || '?').toUpperCase();
     const info = document.createElement('div');
     const nm = document.createElement('div');
-    nm.textContent = v.name;
+    nm.textContent = st ? getRoomHandle(st, v.name, v.pubkey) : formatUserHandle(v.name, v.pubkey, activeChannelId);
     const tm = document.createElement('div');
     tm.className = 'muted small';
-    tm.textContent = `${formatSeenTime(v.seenAtMs)} · ${shortFingerprint(v.pubkey)}`;
+    tm.textContent = formatSeenTime(v.seenAtMs);
     info.append(nm, tm);
     item.append(av, info);
     list.appendChild(item);
   }
   showOverlay('seenModal');
+}
+
+function openUserHistoryModal(channelId, pubkey) {
+  const state = roomsState.get(channelId);
+  if (!state || !pubkey) return;
+  if (state.archivedMembers.has(pubkey)) return;
+
+  const isMe = pubkey === state.identity.pubkeyHex;
+  const chain = rebuildNameChainForPubkey(state, pubkey);
+
+  // Determine current name (from chain, members, presence, read receipts, or own settings)
+  let currentName =
+    (isMe && settings.name) ||
+    state.members.get(pubkey)?.name ||
+    state.presence.get(pubkey)?.name ||
+    (chain.length > 0 ? chain[chain.length - 1].name : '') ||
+    state.readReceipts.get(pubkey)?.name ||
+    '?';
+
+  const currentTag = getRoomTag(state, pubkey, currentName);
+  const currentHandle = `${currentName}-${currentTag}`;
+
+  // Build display entries: if user hasn't sent a message/nick block yet, show a live verified entry
+  const blocks =
+    chain.length > 0
+      ? chain
+      : [
+          {
+            seq: 1,
+            name: currentName,
+            tag: currentTag,
+            handle: currentHandle,
+            prevHash: 'GENESIS',
+            blockHash: computeNameBlockHash({
+              channelId,
+              pubkey,
+              seq: 1,
+              name: currentName,
+              tag: currentTag,
+              prevHash: 'GENESIS',
+              ts: 0,
+            }),
+            ts: Date.now(),
+            source: 'live',
+            chainLinked: true,
+          },
+        ];
+
+  const latest = blocks[blocks.length - 1];
+
+  const av = $('userHistoryAvatar');
+  av.style.background = colorFromPubkey(pubkey);
+  av.textContent = (currentName[0] || '?').toUpperCase();
+
+  $('userHistoryHandle').textContent = isMe ? `${currentHandle} (${t('youTag')})` : currentHandle;
+  $('userHistoryStatus').textContent =
+    blocks.length > 1 ? t('userHistoryVerified', blocks.length) : t('userHistorySingle');
+  $('userHistoryPubkey').textContent = `${pubkey.slice(0, 12)}…${pubkey.slice(-8)}`;
+
+  const list = $('userHistoryChainList');
+  list.textContent = '';
+
+  // Display newest block at top down to #1 Genesis (classic blockchain explorer order)
+  const reversed = [...blocks].reverse();
+  reversed.forEach((b, idx) => {
+    const isLatest = idx === 0 && b.name === latest.name;
+    const card = document.createElement('div');
+    card.className = 'chain-block' + (isLatest ? ' is-current' : '');
+
+    const head = document.createElement('div');
+    head.className = 'chain-block-head';
+
+    const title = document.createElement('div');
+    title.className = 'chain-block-title';
+    const seqSpan = document.createElement('span');
+    seqSpan.className = 'chain-block-seq';
+    seqSpan.textContent = `#${b.seq}`;
+    const handleSpan = document.createElement('span');
+    handleSpan.textContent = b.handle;
+    title.append(seqSpan, handleSpan);
+    head.appendChild(title);
+
+    if (isLatest) {
+      const currBadge = document.createElement('span');
+      currBadge.className = 'chain-block-current';
+      currBadge.textContent = t('userHistoryCurrentBadge');
+      head.appendChild(currBadge);
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'chain-block-meta';
+    const timeEl = document.createElement('span');
+    timeEl.textContent = b.ts ? formatSeenTime(b.ts) : '';
+    const verEl = document.createElement('span');
+    verEl.className = 'chain-block-verified';
+    verEl.textContent =
+      b.source === 'nick'
+        ? b.seq > 1 && b.chainLinked
+          ? t('userHistoryChainLinked')
+          : t('userHistorySigned')
+        : t('userHistoryObserved');
+    meta.append(timeEl, verEl);
+
+    const hashes = document.createElement('div');
+    hashes.className = 'chain-block-hashes';
+    const hashLine = document.createElement('div');
+    hashLine.textContent = `hash: ${b.blockHash.slice(0, 16)}…`;
+    const prevLine = document.createElement('div');
+    prevLine.textContent =
+      b.prevHash === 'GENESIS'
+        ? t('userHistoryGenesis')
+        : `prev: ${String(b.prevHash).slice(0, 16)}…`;
+    hashes.append(hashLine, prevLine);
+
+    card.append(head, meta, hashes);
+    list.appendChild(card);
+  });
+
+  showOverlay('userHistoryModal');
 }
 
 function setCreateRelayModeUI(mode, customUrl = '') {
@@ -2139,7 +3168,11 @@ function openInviteModal() {
   $('inviteRelayText').textContent = isCustom
     ? state.room.customRelay
     : t('relayModePublic');
-  $('inviteMyFingerprint').textContent = shortFingerprint(state.identity.pubkeyHex);
+  $('inviteMyFingerprint').textContent = getRoomHandle(
+    state,
+    settings.name,
+    state.identity.pubkeyHex
+  );
 
   if (navigator.share) {
     $('shareInviteLinkBtn').classList.remove('hidden');
@@ -2153,37 +3186,116 @@ function openInviteModal() {
 function openOnlineModal() {
   const state = roomsState.get(activeChannelId);
   if (!state) return;
+  rebuildRoomDirectory(state);
+
   const list = $('onlineList');
   list.textContent = '';
 
-  const rows = [
-    { pubkey: state.identity.pubkeyHex, name: `${settings.name} (${t('youTag')})` },
-    ...[...state.presence.entries()].map(([pubkey, info]) => ({ pubkey, name: info.name })),
-  ];
+  // 1. Active room members (Online first, then Offline by most recent activity)
+  const membersList = [...state.members.values()].sort((a, b) => {
+    if (a.isMe !== b.isMe) return a.isMe ? -1 : 1;
+    if (a.isOnline !== b.isOnline) return a.isOnline ? -1 : 1;
+    return (b.lastActiveMs || 0) - (a.lastActiveMs || 0);
+  });
 
-  for (const r of rows) {
-    const item = document.createElement('div');
-    item.className = 'online-row';
+  const activeHeading = document.createElement('div');
+  activeHeading.className = 'members-section-title';
+  activeHeading.textContent = t('membersSectionTitle', membersList.length);
+  list.appendChild(activeHeading);
+
+  for (const r of membersList) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'online-row online-row-btn';
+    item.title = t('clickForHistoryHint');
+    item.addEventListener('click', () => {
+      hideOverlay('onlineModal');
+      openUserHistoryModal(state.room.channelId, r.pubkey);
+    });
+
+    const avWrap = document.createElement('div');
+    avWrap.className = 'member-status-wrap';
     const av = document.createElement('div');
     av.className = 'online-avatar';
     av.style.background = colorFromPubkey(r.pubkey);
     av.textContent = (r.name[0] || '?').toUpperCase();
+    const stDot = document.createElement('span');
+    stDot.className = 'member-status-dot' + (r.isOnline ? ' is-online' : '');
+    avWrap.append(av, stDot);
+
     const info = document.createElement('div');
-    const nm = document.createElement('div');
-    nm.textContent = r.name;
-    const fp = document.createElement('div');
-    fp.className = 'muted small mono-input';
-    fp.textContent = shortFingerprint(r.pubkey);
-    info.append(nm, fp);
-    item.append(av, info);
+    const topRow = document.createElement('div');
+    topRow.className = 'member-row-top';
+    const nm = document.createElement('span');
+    const handle = getRoomHandle(state, r.name, r.pubkey);
+    nm.textContent = r.isMe ? `${handle} (${t('youTag')})` : handle;
+    const badge = document.createElement('span');
+    badge.className = 'member-status-badge' + (r.isOnline ? ' is-online' : '');
+    badge.textContent = r.isOnline ? t('memberOnlineStatus') : t('memberOfflineStatus');
+    topRow.append(nm, badge);
+
+    const sub = document.createElement('div');
+    sub.className = 'muted small';
+    const chain = state.nameChains.get(r.pubkey) || [];
+    const prevHandles = chain
+      .filter((b) => b.handle !== handle)
+      .map((b) => b.handle);
+    if (prevHandles.length > 0) {
+      sub.textContent = `⛓ ${t('previouslyKnownAs', [...new Set(prevHandles)].slice(-2).join(', '))}`;
+    } else if (!r.isOnline && r.lastActiveMs) {
+      sub.textContent = formatSeenTime(r.lastActiveMs);
+    } else {
+      sub.textContent = `ID: ${shortFingerprint(r.pubkey)}`;
+    }
+
+    info.append(topRow, sub);
+    item.append(avWrap, info);
     list.appendChild(item);
   }
 
-  if (rows.length === 1) {
+  if (membersList.length === 1 && state.archivedMembers.size === 0) {
     const note = document.createElement('p');
     note.className = 'hint-text';
     note.textContent = t('noOneOnline');
     list.appendChild(note);
+  }
+
+  // 2. Archived members (left & erased their data — display name scrubbed, ONLY last 4-char tag remains!)
+  const archivedList = [...state.archivedMembers.values()].sort(
+    (a, b) => (b.archivedAtMs || 0) - (a.archivedAtMs || 0)
+  );
+  if (archivedList.length > 0) {
+    const div = document.createElement('div');
+    div.className = 'divider';
+    list.appendChild(div);
+
+    const archHeading = document.createElement('div');
+    archHeading.className = 'members-section-title';
+    archHeading.textContent = t('archivedMembersTitle', archivedList.length);
+    list.appendChild(archHeading);
+
+    for (const arch of archivedList) {
+      const row = document.createElement('div');
+      row.className = 'archived-row';
+      const av = document.createElement('div');
+      av.className = 'archived-avatar';
+      av.textContent = '🗄';
+      const info = document.createElement('div');
+      const codeEl = document.createElement('div');
+      codeEl.className = 'archived-handle';
+      codeEl.textContent = `archived-${arch.lastTag}`;
+      const subEl = document.createElement('div');
+      subEl.className = 'muted small';
+      subEl.textContent = t('archivedMemberSub', formatSeenTime(arch.archivedAtMs || Date.now()));
+      info.append(codeEl, subEl);
+      row.append(av, info);
+      list.appendChild(row);
+    }
+
+    const archHint = document.createElement('p');
+    archHint.className = 'hint-text';
+    archHint.textContent = t('archivedMembersHint');
+    list.appendChild(archHint);
   }
 
   showOverlay('onlineModal');
@@ -2200,8 +3312,12 @@ function renderIdentityStatusPill() {
 async function rehydrateAllRoomIdentities() {
   for (const state of roomsState.values()) {
     state.identity = await deriveRoomIdentity(activeMasterSeed, state.room.channelId);
+    rebuildRoomDirectory(state);
   }
+  syncPushRegistration();
   if (activeChannelId) {
+    const activeState = roomsState.get(activeChannelId);
+    if (activeState) renderMyRoomHandle(activeState);
     announcePresence(activeChannelId, 'online');
     renderMessages(false);
     renderOnlineCount();
@@ -2439,7 +3555,12 @@ function openSettingsModal() {
   $('settingsSoundCheck').checked = settings.sound;
   $('settingsNotifyCheck').checked = settings.notifications;
   $('settingsReadReceiptsCheck').checked = settings.readReceipts;
+  $('settingsNtfyUrlInput').value = settings.ntfyUrl || '';
+  $('settingsTurnUrlInput').value = settings.turnUrl || '';
+  $('settingsTurnUserInput').value = settings.turnUser || '';
+  $('settingsTurnPassInput').value = settings.turnPass || '';
   $('settingsGiphyKeyInput').value = settings.giphyApiKey || '';
+  renderWebPushStatus();
   renderPublicRelaysChecklist();
   showOverlay('settingsModal');
 }
@@ -2580,6 +3701,8 @@ function bindEvents() {
     btn.disabled = true;
     btn.textContent = t('derivingKeys');
     try {
+      const prevName = settings.name;
+      const prevSeed = activeMasterSeed;
       settings.name = name.slice(0, 32);
       if (userPass.length > 0) {
         activeMasterSeed = await deriveMasterSeedFromPassword(settings.name, userPass);
@@ -2601,6 +3724,9 @@ function bindEvents() {
         settings.masterSeed = activeMasterSeed;
       }
       saveSettings(settings);
+      if (activeMasterSeed === prevSeed && prevName && settings.name !== prevName) {
+        await broadcastNameChangeAcrossRooms(prevName, settings.name);
+      }
       $('settingsIdentityPassInput').value = '';
       $('sidebarUserName').textContent = settings.name;
       $('lockAppBtn').classList.toggle('hidden', !settings.deviceLockEnabled);
@@ -2620,6 +3746,33 @@ function bindEvents() {
   $('infoBtn').addEventListener('click', () => openInfoModal(settings.lang));
   $('infoLangToggleBtn').addEventListener('click', () => {
     openInfoModal(infoModalLang === 'et' ? 'en' : 'et');
+  });
+  $('notifyBtn').addEventListener('click', async () => {
+    const currentlyActive =
+      settings.notifications && 'Notification' in window && Notification.permission === 'granted';
+    if (currentlyActive) {
+      settings.notifications = false;
+      saveSettings(settings);
+      renderNotifyButtonState();
+      await syncPushRegistration();
+      showToast(t('notifyDisabledToast'));
+      return;
+    }
+    const perm = await requestNotificationPermission();
+    if (perm === 'granted') {
+      settings.notifications = true;
+      saveSettings(settings);
+      playMessageSound();
+      vibrateDevice([150, 80, 150]);
+      renderNotifyButtonState();
+      await syncPushRegistration();
+      showToast(t('notifyEnabledToast'));
+    } else {
+      settings.notifications = false;
+      saveSettings(settings);
+      renderNotifyButtonState();
+      showToast(t('notifyDeniedToast'), 4500);
+    }
   });
   $('settingsBtn').addEventListener('click', openSettingsModal);
   $('relayStatusBtn').addEventListener('click', openSettingsModal);
@@ -2747,6 +3900,10 @@ function bindEvents() {
   // Chat header actions
   $('inviteRoomBtn').addEventListener('click', openInviteModal);
   $('onlinePillBtn').addEventListener('click', openOnlineModal);
+  $('myHandleBtn').addEventListener('click', () => {
+    const st = roomsState.get(activeChannelId);
+    if (st) openUserHistoryModal(st.room.channelId, st.identity.pubkeyHex);
+  });
   $('voiceCallBtn').addEventListener('click', () => startRoomCall(false));
   $('videoCallBtn').addEventListener('click', () => startRoomCall(true));
   $('joinCallAudioBtn').addEventListener('click', () => startRoomCall(false));
@@ -2777,7 +3934,26 @@ function bindEvents() {
       showToast(t('callMediaError'), 5000);
     }
   });
-  $('hangupBtn').addEventListener('click', () => callManager?.leaveCall());
+  $('flipCamBtn').addEventListener('click', async () => {
+    try {
+      await callManager?.switchCamera();
+    } catch {
+      showToast(t('callMediaError'), 4000);
+    }
+  });
+  $('callCameraSelect').addEventListener('change', async (e) => {
+    const devId = e.target.value;
+    if (!devId) return;
+    try {
+      await callManager?.selectCamera(devId);
+    } catch {
+      showToast(t('callMediaError'), 4000);
+    }
+  });
+  $('hangupBtn').addEventListener('click', () => {
+    stopCallRingtone();
+    callManager?.leaveCall();
+  });
 
   function getOwnMessageIdsInRoom(state) {
     const ids = [];
@@ -2790,6 +3966,9 @@ function bindEvents() {
   async function leaveActiveRoomLocally() {
     const state = roomsState.get(activeChannelId);
     if (!state) return;
+    clearTimeout(membershipAnchorTimers.get(activeChannelId));
+    membershipAnchorTimers.delete(activeChannelId);
+    stopCallRingtone();
     if (callManager?.activeChannelId === activeChannelId) {
       await callManager.leaveCall();
     }
@@ -2811,13 +3990,98 @@ function bindEvents() {
     }
   }
 
+  async function archiveAndLeaveActiveRoom() {
+    const state = roomsState.get(activeChannelId);
+    if (!state) return;
+    const channelId = state.room.channelId;
+    const myPubkey = state.identity.pubkeyHex;
+
+    rebuildRoomDirectory(state);
+    const chain = state.nameChains.get(myPubkey) || [];
+    const currentTag = getRoomTag(state, myPubkey, settings.name);
+    const lastTag =
+      chain.length > 0 && chain[chain.length - 1].name === settings.name
+        ? chain[chain.length - 1].tag
+        : currentTag;
+    const reservedTags = [...new Set([...chain.map((b) => b.tag), lastTag])]
+      .filter(isValidHandleTag)
+      .slice(0, 20);
+
+    // 1. Delete all own chat messages (locally + NIP-09 + encrypted tombstone)
+    const ownMsgIds = getOwnMessageIdsInRoom(state);
+    if (ownMsgIds.length > 0) {
+      await deleteOwnMessages(channelId, ownMsgIds);
+    }
+
+    // 2. Also send NIP-09 deletion for our own nick/read/react events so relays wipe our display names too
+    let latestOwnTs = 0;
+    const ownMetaIds = new Set(state.ownMetaEventIds);
+    for (const n of state.nickEvents.values()) {
+      if (n.pubkey === myPubkey) {
+        ownMetaIds.add(n.id);
+        latestOwnTs = Math.max(latestOwnTs, typeof n.tsMs === 'number' ? n.tsMs : (n.createdAt || 0) * 1000);
+      }
+    }
+    for (const m of state.messages.values()) {
+      if (m.pubkey === myPubkey) {
+        latestOwnTs = Math.max(latestOwnTs, typeof m.tsMs === 'number' ? m.tsMs : (m.createdAt || 0) * 1000);
+      }
+    }
+    const metaList = [...ownMetaIds];
+    if (metaList.length > 0 && pool) {
+      for (let i = 0; i < metaList.length; i += 100) {
+        const chunk = metaList.slice(i, i + 100);
+        const nip09Meta = await signNostrEvent(
+          {
+            kind: CONFIG.DELETE_KIND,
+            tags: [...chunk.map((id) => ['e', id]), ['k', String(CONFIG.MSG_KIND)]],
+            content: '',
+          },
+          state.identity.privKeyBytes
+        );
+        pool.publish(nip09Meta, getRoomRelays(state.room));
+      }
+    }
+
+    // 3. Publish signed encrypted archive record (NO display name — ONLY lastTag + reservedTags!)
+    const archiveTs = Math.max(Date.now(), latestOwnTs + 1000);
+    const archivePayload = {
+      v: 1,
+      t: 'archive',
+      lastTag,
+      reservedTags,
+      ts: archiveTs,
+    };
+    const encArchive = await encryptRoomPayload(
+      state.aesKey,
+      myPubkey,
+      channelId,
+      archivePayload
+    );
+    const archiveEv = await signNostrEvent(
+      {
+        kind: CONFIG.MSG_KIND,
+        tags: [['e', channelId, '', 'root']],
+        content: encArchive,
+      },
+      state.identity.privKeyBytes
+    );
+    if (pool) pool.publish(archiveEv, getRoomRelays(state.room));
+
+    // Give WebSocket a brief moment to flush before tearing down the room subscription
+    await new Promise((r) => setTimeout(r, 150));
+    showToast(t('archivedAndLeftToast', lastTag), 4000);
+    await leaveActiveRoomLocally();
+  }
+
   $('leaveRoomBtn').addEventListener('click', () => {
     const state = roomsState.get(activeChannelId);
     if (!state) return;
     const ownCount = getOwnMessageIdsInRoom(state).length;
     $('leaveRoomDesc').textContent = t('leaveModalDesc', state.room.name, ownCount);
     $('purgeOwnStayBtn').disabled = ownCount === 0;
-    $('purgeOwnAndLeaveBtn').disabled = ownCount === 0;
+    // Always allow erasing profile/name & archiving when leaving, even with 0 messages
+    $('purgeOwnAndLeaveBtn').disabled = false;
     showOverlay('leaveRoomModal');
   });
 
@@ -2840,13 +4104,8 @@ function bindEvents() {
   });
 
   $('purgeOwnAndLeaveBtn').addEventListener('click', async () => {
-    const state = roomsState.get(activeChannelId);
-    if (!state) return;
-    const ownIds = getOwnMessageIdsInRoom(state);
     hideOverlay('leaveRoomModal');
-    const deleted = await deleteOwnMessages(state.room.channelId, ownIds);
-    if (deleted > 0) showToast(t('myMsgsDeletedToast', deleted));
-    await leaveActiveRoomLocally();
+    await archiveAndLeaveActiveRoom();
   });
 
   // Invite modal buttons
@@ -2974,14 +4233,65 @@ function bindEvents() {
   });
 
   $('settingsNotifyCheck').addEventListener('change', async (e) => {
-    if (e.target.checked && 'Notification' in window && Notification.permission === 'default') {
-      const perm = await Notification.requestPermission();
-      if (perm !== 'granted') e.target.checked = false;
+    if (e.target.checked) {
+      const perm = await requestNotificationPermission();
+      if (perm !== 'granted') {
+        e.target.checked = false;
+        showToast(t('notifyDeniedToast'), 4500);
+      }
     }
   });
 
-  $('settingsForm').addEventListener('submit', (e) => {
+  $('testNotifyBtn').addEventListener('click', async () => {
+    playMessageSound();
+    vibrateDevice([200, 100, 200]);
+    if ('Notification' in window) {
+      const perm =
+        Notification.permission === 'default'
+          ? await requestNotificationPermission()
+          : Notification.permission;
+      if (perm === 'granted') {
+        $('settingsNotifyCheck').checked = true;
+        if (!settings.notifications) {
+          settings.notifications = true;
+          saveSettings(settings);
+          renderNotifyButtonState();
+          syncPushRegistration();
+        }
+        await showOsNotification({
+          title: t('testNotifyTitle'),
+          body: t('testNotifyBody'),
+          tag: 'decloc-test',
+        });
+      } else {
+        showToast(t('notifyDeniedToast'), 4500);
+      }
+    }
+  });
+
+  $('genNtfyBtn').addEventListener('click', () => {
+    $('settingsNtfyUrlInput').value = `https://ntfy.sh/decloc-${generatePassphrase(3, 4)}`;
+  });
+
+  $('testNtfyBtn').addEventListener('click', async () => {
+    const raw = $('settingsNtfyUrlInput').value;
+    const clean = normalizeNtfyUrl(raw);
+    if (!clean) {
+      showToast(t('ntfyFailedToast'), 4000);
+      return;
+    }
+    $('settingsNtfyUrlInput').value = clean;
+    const ok = await sendNtfyPing(clean, {
+      isCall: false,
+      title: t('testNotifyTitle'),
+      body: t('testNotifyBody'),
+    });
+    showToast(ok ? t('ntfySentToast') : t('ntfyFailedToast'), 3500);
+  });
+
+  $('settingsForm').addEventListener('submit', async (e) => {
     e.preventDefault();
+    const prevName = settings.name;
     const newName = $('settingsNameInput').value.trim();
     if (newName) settings.name = newName.slice(0, 32);
     settings.theme = $('settingsThemeSelect').value;
@@ -2989,6 +4299,10 @@ function bindEvents() {
     settings.sound = $('settingsSoundCheck').checked;
     settings.notifications = $('settingsNotifyCheck').checked;
     settings.readReceipts = $('settingsReadReceiptsCheck').checked;
+    settings.ntfyUrl = normalizeNtfyUrl($('settingsNtfyUrlInput').value);
+    settings.turnUrl = $('settingsTurnUrlInput').value.trim();
+    settings.turnUser = $('settingsTurnUserInput').value.trim();
+    settings.turnPass = $('settingsTurnPassInput').value.trim();
     settings.giphyApiKey = $('settingsGiphyKeyInput').value.trim();
 
     const selectedPublic = [
@@ -3001,11 +4315,18 @@ function bindEvents() {
     saveSettings(settings);
     applyTheme();
     applyI18n();
+    renderNotifyButtonState();
     $('sidebarUserName').textContent = settings.name;
     syncSubscriptions();
+    if (prevName && settings.name !== prevName) {
+      await broadcastNameChangeAcrossRooms(prevName, settings.name);
+    }
     if (activeChannelId) {
       const st = roomsState.get(activeChannelId);
-      if (st) renderActiveRoomRelayBadge(st.room);
+      if (st) {
+        renderMyRoomHandle(st);
+        renderActiveRoomRelayBadge(st.room);
+      }
       announcePresence(activeChannelId, 'online');
       renderOnlineCount();
     }
@@ -3045,6 +4366,12 @@ function bindEvents() {
         const validPub = data.profile.relays.filter((r) => CONFIG.DEFAULT_RELAYS.includes(r));
         if (validPub.length > 0) settings.relays = validPub;
       }
+      if (typeof data.profile.ntfyUrl === 'string') {
+        settings.ntfyUrl = normalizeNtfyUrl(data.profile.ntfyUrl);
+      }
+      if (typeof data.profile.turnUrl === 'string') settings.turnUrl = data.profile.turnUrl.trim();
+      if (typeof data.profile.turnUser === 'string') settings.turnUser = data.profile.turnUser.trim();
+      if (typeof data.profile.turnPass === 'string') settings.turnPass = data.profile.turnPass.trim();
       saveSettings(settings);
 
       roomsState.clear();
@@ -3089,9 +4416,26 @@ function bindEvents() {
     if (chId) selectRoom(chId);
   });
 
-  // Mark messages read when returning to tab
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && activeChannelId) {
+  // Mark messages read, stop attention alerts, and revive relays + WebRTC calls on unlock / return
+  let wasHidden = false;
+  const handleAppReturn = (evt) => {
+    if (document.hidden) {
+      wasHidden = true;
+      callManager?.handleAppHidden();
+      return;
+    }
+    const wakingFromSleep = wasHidden || evt?.type === 'online';
+    wasHidden = false;
+    pool?.reconnectNow(wakingFromSleep);
+    if (wakingFromSleep) {
+      callManager?.handleAppResume().catch(() => {});
+    } else {
+      resumeAllCallMedia();
+    }
+    if (!document.hasFocus()) return;
+    stopTitleFlash();
+    stopCallRingtone();
+    if (activeChannelId) {
       const state = roomsState.get(activeChannelId);
       if (state) {
         markRoomAsRead(state);
@@ -3100,10 +4444,14 @@ function bindEvents() {
         updateTabTitle();
       }
     }
-  });
+  };
+  document.addEventListener('visibilitychange', handleAppReturn);
+  window.addEventListener('focus', handleAppReturn);
+  window.addEventListener('online', handleAppReturn);
 
   // Clean presence & call teardown on tab close
   window.addEventListener('pagehide', () => {
+    stopCallRingtone();
     if (activeChannelId) announcePresence(activeChannelId, 'leave');
     if (callManager) callManager.leaveCall();
   });
@@ -3139,9 +4487,15 @@ function applyI18n() {
     if (typeof val === 'string') el.title = val;
   });
   if (pool) handleRelayStatusChange();
+  renderNotifyButtonState();
+  renderWebPushStatus();
   if (activeChannelId) {
     const st = roomsState.get(activeChannelId);
-    if (st) renderActiveRoomRelayBadge(st.room);
+    if (st) {
+      renderMyRoomHandle(st);
+      renderActiveRoomRelayBadge(st.room);
+      renderOnlineCount();
+    }
   }
 }
 
@@ -3184,30 +4538,6 @@ function formatDateHeading(ms) {
     month: 'long',
     year: 'numeric',
   });
-}
-
-function playSoftChime() {
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    if (!audioCtx) audioCtx = new Ctx();
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-    const now = audioCtx.currentTime;
-    const osc = audioCtx.createOscillator();
-    const gain = audioCtx.createGain();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(660, now);
-    osc.frequency.setValueAtTime(880, now + 0.065);
-    gain.gain.setValueAtTime(0.001, now);
-    gain.gain.exponentialRampToValueAtTime(0.07, now + 0.015);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
-    osc.connect(gain);
-    gain.connect(audioCtx.destination);
-    osc.start(now);
-    osc.stop(now + 0.24);
-  } catch {
-    // ignore audio autoplay restrictions
-  }
 }
 
 async function copyText(str) {

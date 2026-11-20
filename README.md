@@ -20,12 +20,17 @@ You do **not** need a company account, phone number, email address, app store, o
   * When creating a room, choose either **Public Nostr relays** (5 open defaults that you can toggle individually in Settings) **OR** a **Custom relay** (your own phone/VPS relay `wss://...` or a public `.onion` Nostr relay in Tor Browser).
   * Once created, a room is permanently locked to that relay choice — private-relay rooms **never** send traffic to public relays.
 * **Optional Personal Password (portable identity + device lock):**
-  * Leave blank for instant device-only access, **or** set an optional personal password to keep the exact same verified `#xxxx` badge across phones/computers (and delete your own past messages from any device).
+  * Leave blank for instant device-only access, **or** set an optional personal password to keep the exact same verified identity across phones/computers (and delete your own past messages from any device).
   * Optionally enable **Device lock** to store your key encrypted (`AES-256-GCM`) and require your password when reopening the app.
+* **Unforgeable Room Handles (`Name-xxxx`), Persistent Members & Archived Tags:**
+  * Every participant automatically gets a room-unique 4-character alphanumeric tag (e.g. `Jaan-4fl7`) derived cryptographically from their room key — impossible to edit or spoof, so two people with the same name are always distinguishable.
+  * When someone renames (e.g. `Jaan-4fl7` → `Ott-56gb`), the change is signed and hash-linked like a mini blockchain in that room; clicking any name shows their full verified name history.
+  * The **Members** list shows everyone in the room (both **Online** and **Offline**). If a user leaves and erases all their data from the room, their messages and display name are completely removed from Members and only their last unique code (e.g. `archived-56gb`) remains under **Archived members**. If 4-char codes ever saturate (e.g. bot flood), the oldest archived tag is released one-by-one (**FIFO**); if all slots are held by active members, tags automatically expand **4 → 5 → 6…** characters so the room never hits a member cap.
 * **Delete only your own messages from everywhere:** delete individual messages or all of your messages in a room — removes them from your browser, sends a standard **NIP-09 (`kind: 5`)** deletion request to Nostr relays, and sends an encrypted delete instruction to other participants' devices. Only the original author can delete their own messages.
 * **Read receipts ("Seen by"):** subtly shows who saw the latest message and at what time (can be turned off in Settings).
 * **Full Emoji & GIF support:** 450+ categorized emojis with offline English & Estonian search, recent emojis, `+` full emoji reactions on messages, plus GIF support via direct `https://` URLs or an optional free **GIPHY API key**.
-* **P2P WebRTC voice & video calls:** direct peer-to-peer calls inside any room with 4 Messenger/WhatsApp-style layouts (**Compact**, **Grid**, **50/50 Split**, **Spotlight + PiP**) and clean icon controls.
+* **P2P WebRTC voice & video calls:** direct peer-to-peer calls inside any room with 4 Messenger/WhatsApp-style layouts (**Compact**, **Grid**, **50/50 Split**, **Spotlight + PiP**), front/rear camera switch, **Screen Wake Lock** (keeps mobile screens awake), automatic camera & ICE-restart recovery after screen lock or network switches, and optional **TURN server** support in Settings for strict 4G/5G NATs.
+* **Strong Multi-Channel Notifications:** 1-click bell (`🔔`) in the header enables OS notifications (Desktop, Android Chrome, iOS 16.4+ PWA), louder 2-note chime + mobile vibration, incoming call ringtone, blinking tab title + red-dot unread favicon badge, PWA home-screen app badge, built-in **VAPID Web Push** on `relay/server.mjs` (wakes locked/closed mobile browsers!), and optional privacy-safe **`ntfy.sh`** push alerts for static GitHub Pages.
 * **Installable PWA:** add to your phone's home screen like a normal app. Includes dark/light theme, English (default) & Estonian interface, and profile backup export/import.
 
 ---
@@ -190,6 +195,15 @@ Reload Caddy (`sudo systemctl reload caddy`) — Caddy automatically obtains and
 
 ---
 
+## Strong Notifications & Lock-Screen Push Alerts
+
+To make sure you never miss a message or incoming call:
+1. **1-click Notifications:** Click the bell icon (`🔔`) in the top-left header (or open **Settings → Notifications → Test sound & alert**) to enable OS pop-ups, sound, vibration, blinking tab title, red unread badge on the browser tab & PWA icon, and incoming call ringtones.
+2. **Waking closed/locked phones when self-hosting (`relay/server.mjs`):** Built-in **VAPID Web Push** (`RFC 8292` + `RFC 8291`) is automatic! Once you install the PWA and click `🔔`, your own server wakes your phone even when the browser is closed (only a generic *"New encrypted message"* / *"Incoming voice/video call"* alert is sent — never message plaintext).
+3. **Waking closed/locked phones on static GitHub Pages (optional `ntfy.sh`):** Install the free **ntfy** app (Android/iPhone/Desktop), generate a secret topic URL in **Settings → Optional ntfy.sh push URL**, and subscribe your group to that same topic in the ntfy app. Again, only a generic privacy-safe alert is sent — never your chat text.
+
+---
+
 ## Using Public `.onion` Nostr Relays (Tor Browser)
 
 DecLoc Chat supports `.onion` Nostr relays in **Custom relay** mode:
@@ -277,12 +291,17 @@ Sul **ei ole vaja** suurfirma kontot, telefoninumbrit, e-maili, äpipoodi ega ra
   * Toa loomisel valid kas **Avalikud Nostr relay'd** (5 vaikeserverit, mida saab Seadetes ükshaaval sisse/välja lülitada) **VÕI** **Enda relay** (sinu telefoni/VPS-i `wss://...` aadress või avalik `.onion` Nostr relay Tor Browseris).
   * Pärast loomist on tuba püsivalt selle relay külge lukustatud — oma relay-ga loodud toa liiklus **ei lähe kunagi** avalikesse relay'desse.
 * **Valikuline isiklik parool (kaasaskantav identiteet + seadmelukk):**
-  * Jäta tühjaks koheseks seadmepõhiseks kasutamiseks **või** määra valikuline isiklik parool, millega saad teises telefonis/arvutis tagasi täpselt sama kontrollkoodi (`#xxxx`) ja õiguse kustutada enda vanu sõnumeid.
+  * Jäta tühjaks koheseks seadmepõhiseks kasutamiseks **või** määra valikuline isiklik parool, millega saad teises telefonis/arvutis tagasi täpselt sama krüptograafilise identiteedi ja õiguse kustutada enda vanu sõnumeid.
   * Soovi korral lülita sisse **Seadmelukk** (*Device lock*), mis hoiab sinu võtit seadmes krüpteeritult (`AES-256-GCM`) ja küsib parooli äpi uuesti avamisel.
+* **Võltsimatud toanimed (`Nimi-xxxx`), liikmete nimekiri ja arhiveeritud koodid:**
+  * Iga kasutaja nime taha arvutatakse automaatselt tema toavõtmest 4 unikaalset tähte/numbrit (nt `Jaan-4fl7`), mida kasutaja ei saa ise määrata ega muuta — nii on ka samanimelised inimesed alati selgelt eristatavad.
+  * Nime muutmisel (nt `Jaan-4fl7` → `Ott-56gb`) salvestatakse allkirjastatud ja räsiga eelmise nime külge seotud plokk jututuppa; nimele klikkides näeb kogu kinnitatud nimeajalugu.
+  * **Liikmete** nimekiri näitab kõiki tuppa sisenenud kasutajaid (nii **Sees** kui ka **Ühenduseta**). Kui kasutaja lahkub koos kõigi oma andmete kustutamisega, eemaldatakse tema nimi ja sõnumid täielikult ning **Arhiveeritud liikmete** alla jääb ainult tema viimane unikaalne kood (nt `archived-56gb`). Kui 4-kohalised koodid peaksid kunagi täituma (nt automaatika rünnakul), vabastatakse arhiivist vanim kood ühekaupa (**FIFO**) ning kui kõik on aktiivsetel liikmetel, laieneb kood automaatselt **4 → 5 → 6…** sümbolile — nii ei saa jututuba kunagi täis.
 * **Ainult enda sõnumite kustutamine igalt poolt:** kustuta üksik sõnum või kõik enda sõnumid toas — eemaldatakse sinu brauserist, saadetakse standardne **NIP-09 (`kind: 5`)** kustutamispalve Nostr-serveritele ning krüpteeritud kustutuskäsk teiste osalejate seadmetele. Kustutada saab ainult sõnumi tegelik autor.
 * **Lugemiskinnitused („Nähtud“):** näitab väikeselt sõnumi all, kes ja mis kell viimast teksti nägi (saab Seadetes välja lülitada).
 * **Täielik Emoji ja GIF tugi:** 450+ kategooriatega emojit (otsing nii eesti kui inglise keeles, hiljutised emojid, `＋` täielik reaktsioonivalija) ning GIF-ide saatmine otselingiga (`https://`) või valikulise tasuta **GIPHY API võtmega**.
-* **P2P WebRTC hääl- ja videokõned:** otse brauserite vahel koos 4 Messengeri/WhatsAppi stiilis paigutusega (**Kompaktne**, **Võrdne täisekraan**, **50/50 jagatud ekraan**, **Fookus + paremal all pilt-pildis**) ja puhaste ikooninuppudega.
+* **P2P WebRTC hääl- ja videokõned:** otse brauserite vahel koos 4 Messengeri/WhatsAppi stiilis paigutusega (**Kompaktne**, **Võrdne täisekraan**, **50/50 jagatud ekraan**, **Fookus + paremal all pilt-pildis**), esi-/tagakaamera vahetuse, **Screen Wake Lock'i** (hoiab kõne ajal ekraani ärkvel), automaatse kaamera ja ICE-taastusega pärast ekraanilukku/võrguvahetust ning valikulise **TURN-serveri** seadega rangete 4G/5G võrkude jaoks.
+* **Võimsad teated igal seadmel:** 1-kliki kelluke (`🔔`) päises lülitab sisse OS-teavitused (arvuti, Android Chrome, iOS 16.4+ PWA), selgema 2-toonilise heli + mobiilse vibratsiooni, sissetuleva kõne helina, vilkuva brauseri saki + punase lugemata märgi ikoonil, PWA avakuva punase numbri, sisseehitatud **VAPID Web Push'i** serveris `relay/server.mjs` (äratab ka lukus/suletud telefoni!) ja valikulise privaatsuskindla **`ntfy.sh`** toe GitHub Pagesi jaoks.
 * **Paigaldatav PWA:** lisa telefoni avakuvale nagu päris äpp. Tume/hele teema, inglise (vaikimisi) ja eesti keel, varukoopia eksport/import.
 
 ---
@@ -444,6 +463,15 @@ chat.sinudomeen.ee {
 }
 ```
 Laadi Caddy uuesti (`sudo systemctl reload caddy`) — Caddy hangib ja uuendab tasuta Let's Encrypti HTTPS-sertifikaadi (koos `wss://` WebSocketi toega) täiesti automaatselt!
+
+---
+
+## Tugevad teated ja lukustatud ekraani push-teavitused
+
+Et ükski sõnum ega kõne märkamata ei jääks:
+1. **1-kliki teated:** vajuta päises kellukese (`🔔`) ikoonile (või ava **Seaded → Teated → Testi heli ja teavitust**), et aktiveerida süsteemi teavitused, heli, vibratsioon, vilkuv brauseri sakk, punane lugemata sõnumite täpp ikoonil ja sissetuleva kõne helin.
+2. **Lukus/suletud telefoni äratamine oma serveris (`relay/server.mjs`):** sisseehitatud **VAPID Web Push** (`RFC 8292` + `RFC 8291`) töötab automaatselt! Lisa äpp avakuvale (PWA) ja vajuta `🔔` — sinu enda server äratab telefoni ka siis, kui brauser on täiesti suletud (saadetakse ainult üldine *"New encrypted message"* / *"Incoming voice/video call"* äratus, mitte kunagi sõnumi teksti).
+3. **Lukus/suletud telefoni äratamine GitHub Pagesis (valikuline `ntfy.sh`):** paigalda telefoni tasuta **ntfy** äpp, genereeri **Seaded → Valikuline ntfy.sh push-aadress** alt salajane aadress ja lisa sama teema oma grupi liikmete ntfy äppi. Ka sinna saadetakse ainult üldine äratus — mitte kunagi päris vestluse sisu.
 
 ---
 

@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   bytesToHex,
   hexToBytes,
+  sha256Hex,
+  sha256SyncHex,
   getPublicKeyHex,
   schnorrSign,
   schnorrVerify,
@@ -17,6 +19,11 @@ import {
   encryptLocalVault,
   decryptLocalVault,
   generatePassphrase,
+  isValidHandleTag,
+  deriveHandleTag,
+  resolveUniqueHandleTag,
+  formatUserHandle,
+  computeNameBlockHash,
   isOnionRelay,
   normalizeRelayUrl,
   encodeInviteUrl,
@@ -202,4 +209,170 @@ test('Personal password derives deterministic portable identity and encrypts loc
   const unlocked = await decryptLocalVault('minu-saladus-42', vault);
   assert.deepEqual(unlocked, { masterSeed: s1 });
   assert.equal(await decryptLocalVault('vale-parool', vault), null);
+});
+
+test('sha256SyncHex matches WebCrypto sha256Hex bit-for-bit across edge lengths & UTF-8', async () => {
+  const samples = [
+    '',
+    'abc',
+    'a'.repeat(55),
+    'a'.repeat(56),
+    'a'.repeat(63),
+    'a'.repeat(64),
+    'a'.repeat(129),
+    'Jaan-4ftb → Erik-3sf6 õäöü🚀',
+  ];
+  for (const s of samples) {
+    assert.equal(sha256SyncHex(s), await sha256Hex(s));
+  }
+});
+
+test('Unique per-room 4-char handle tags & verifiable name-change hash-chain', async () => {
+  const roomA = await deriveRoomSecrets('Tuba A', 'parool-a');
+  const roomB = await deriveRoomSecrets('Tuba B', 'parool-b');
+  const user1 = await deriveRoomIdentity(generateMasterSeed(), roomA.channelId);
+  const user2 = await deriveRoomIdentity(generateMasterSeed(), roomA.channelId);
+
+  // 1. Format: Name-xxxx with 4 unambiguous alphanumeric chars (no 0/o/1/i/l)
+  const h1Jaan = formatUserHandle('Jaan', user1.pubkeyHex, roomA.channelId);
+  const h2Jaan = formatUserHandle('Jaan', user2.pubkeyHex, roomA.channelId);
+  assert.match(h1Jaan, /^Jaan-[a-hjkmnp-z2-9]{4}$/);
+  assert.match(h2Jaan, /^Jaan-[a-hjkmnp-z2-9]{4}$/);
+
+  // 2. Two different users with identical display name "Jaan" get distinct unforgeable handles
+  assert.notEqual(h1Jaan, h2Jaan);
+
+  // 3. Case/spacing normalized deterministically for the same user
+  assert.equal(
+    deriveHandleTag(user1.pubkeyHex, roomA.channelId, 'Jaan'),
+    deriveHandleTag(user1.pubkeyHex, roomA.channelId, '  jaan  ')
+  );
+
+  // 4. Renaming Jaan -> Erik yields a distinct tag bound to the same pubkey (e.g. Jaan-xxxx -> Erik-yyyy)
+  const h1Erik = formatUserHandle('Erik', user1.pubkeyHex, roomA.channelId);
+  assert.match(h1Erik, /^Erik-[a-hjkmnp-z2-9]{4}$/);
+  assert.notEqual(
+    deriveHandleTag(user1.pubkeyHex, roomA.channelId, 'Jaan'),
+    deriveHandleTag(user1.pubkeyHex, roomA.channelId, 'Erik')
+  );
+
+  // 5. Same pubkey in different rooms yields different tags
+  assert.notEqual(
+    deriveHandleTag(user1.pubkeyHex, roomA.channelId, 'Jaan'),
+    deriveHandleTag(user1.pubkeyHex, roomB.channelId, 'Jaan')
+  );
+
+  // 6. Hash-chain links Block #1 (Jaan) -> Block #2 (Erik) and detects any tampering
+  const tag1 = deriveHandleTag(user1.pubkeyHex, roomA.channelId, 'Jaan');
+  const tag2 = deriveHandleTag(user1.pubkeyHex, roomA.channelId, 'Erik');
+  const b1Hash = computeNameBlockHash({
+    channelId: roomA.channelId,
+    pubkey: user1.pubkeyHex,
+    seq: 1,
+    name: 'Jaan',
+    tag: tag1,
+    prevHash: 'GENESIS',
+    ts: 1700000001000,
+  });
+  const b2Hash = computeNameBlockHash({
+    channelId: roomA.channelId,
+    pubkey: user1.pubkeyHex,
+    seq: 2,
+    name: 'Erik',
+    tag: tag2,
+    prevHash: b1Hash,
+    ts: 1700000005000,
+  });
+  const b2Tampered = computeNameBlockHash({
+    channelId: roomA.channelId,
+    pubkey: user1.pubkeyHex,
+    seq: 2,
+    name: 'Erik',
+    tag: tag2,
+    prevHash: '0'.repeat(64),
+    ts: 1700000005000,
+  });
+  assert.equal(b1Hash.length, 64);
+  assert.equal(b2Hash.length, 64);
+  assert.notEqual(b1Hash, b2Hash);
+  assert.notEqual(b2Hash, b2Tampered);
+
+  // 7. Non-reusable tag reservation: archived/used tags are strictly skipped deterministically
+  assert.equal(isValidHandleTag(tag1), true);
+  assert.equal(isValidHandleTag('4ft7k'), true); // 5-char expanded tag valid
+  assert.equal(isValidHandleTag('4ft7kp'), true); // 6-char expanded tag valid
+  assert.equal(isValidHandleTag('0oil'), false);
+  assert.equal(isValidHandleTag('abc'), false);
+  const nonce0 = deriveHandleTag(user2.pubkeyHex, roomA.channelId, 'Jaan', 0);
+  const nonce1 = deriveHandleTag(user2.pubkeyHex, roomA.channelId, 'Jaan', 1);
+  const reserved = new Set([nonce0, nonce1]);
+  const resolved = resolveUniqueHandleTag(user2.pubkeyHex, roomA.channelId, 'Jaan', reserved);
+  assert.equal(isValidHandleTag(resolved), true);
+  assert.equal(reserved.has(resolved), false);
+  assert.equal(resolved, resolveUniqueHandleTag(user2.pubkeyHex, roomA.channelId, 'Jaan', reserved));
+});
+
+test('Handle tag exhaustion defense: economical FIFO archive recycle first, then auto-expand 4 -> 5 -> 6 -> 7 chars', async () => {
+  const room = await deriveRoomSecrets('Suur Tuba', 'suur-parool');
+  const user = await deriveRoomIdentity(generateMasterSeed(), room.channelId);
+
+  // 1. Simulate ALL 4-char probes saturated, with 2 archived tags in FIFO queue (oldest first!)
+  const saturated4 = new Set();
+  for (let n = 0; n < 8; n++) {
+    saturated4.add(deriveHandleTag(user.pubkeyHex, room.channelId, 'Mari', n, 4));
+  }
+  const fifo = ['4ft7', '56gb']; // '4ft7' is oldest archived, '56gb' is newer
+  saturated4.add('4ft7');
+  saturated4.add('56gb');
+
+  const recycledList = [];
+  const t1 = resolveUniqueHandleTag(user.pubkeyHex, room.channelId, 'Mari', saturated4, {
+    maxProbesPerLen: 8,
+    archivedFifoQueue: fifo,
+    activeTagsSet: new Set(),
+    onRecycle: (tag) => recycledList.push(tag),
+  });
+  // Releases ONLY the oldest archived tag ('4ft7') via FIFO, keeping handle at 4 chars!
+  assert.equal(t1, '4ft7');
+  assert.deepEqual(recycledList, ['4ft7']);
+  assert.deepEqual(fifo, ['56gb']);
+
+  // Next allocation when still saturated releases the second oldest ('56gb') via FIFO
+  saturated4.add('4ft7'); // now held by active user!
+  const t2 = resolveUniqueHandleTag(user.pubkeyHex, room.channelId, 'Mari', saturated4, {
+    maxProbesPerLen: 8,
+    archivedFifoQueue: fifo,
+    activeTagsSet: new Set(['4ft7']),
+    onRecycle: (tag) => recycledList.push(tag),
+  });
+  assert.equal(t2, '56gb');
+  assert.deepEqual(recycledList, ['4ft7', '56gb']);
+  assert.deepEqual(fifo, []);
+
+  // 2. Now FIFO archive queue is EMPTY (all 4-char codes held by ACTIVE members) -> auto-expands to 5 chars!
+  saturated4.add('56gb');
+  const t5 = resolveUniqueHandleTag(user.pubkeyHex, room.channelId, 'Mari', saturated4, {
+    maxProbesPerLen: 8,
+    archivedFifoQueue: fifo,
+    activeTagsSet: new Set(['4ft7', '56gb']),
+  });
+  assert.equal(t5.length, 5);
+  assert.equal(isValidHandleTag(t5), true);
+
+  // 3. Simulate 4-char, 5-char, AND 6-char spaces completely full by active members -> expands cleanly to 7 chars!
+  const mockFullUpTo6 = { has: (tag) => tag.length <= 6 };
+  const t7 = resolveUniqueHandleTag(user.pubkeyHex, room.channelId, 'Mari', mockFullUpTo6, {
+    maxProbesPerLen: 8,
+    archivedFifoQueue: [],
+  });
+  assert.equal(t7.length, 7);
+  assert.equal(isValidHandleTag(t7), true);
+  // Deterministic across devices
+  assert.equal(
+    t7,
+    resolveUniqueHandleTag(user.pubkeyHex, room.channelId, 'Mari', mockFullUpTo6, {
+      maxProbesPerLen: 8,
+      archivedFifoQueue: [],
+    })
+  );
 });

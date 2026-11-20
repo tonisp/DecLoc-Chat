@@ -121,6 +121,21 @@ export class RelayPool {
     return this.getStatuses(filterUrls).filter((s) => s.status === 'connected').length;
   }
 
+  // Immediately wake up disconnected relays after mobile screen unlock / network switch
+  reconnectNow(refreshOpenSubs = false) {
+    if (this.destroyed) return;
+    for (const state of this.relays.values()) {
+      if (!state.ws || state.ws.readyState === WebSocket.CLOSED || state.ws.readyState === WebSocket.CLOSING) {
+        clearTimeout(state.timer);
+        state.retries = 0;
+        this._connect(state);
+      } else if (refreshOpenSubs && state.ws.readyState === WebSocket.OPEN) {
+        // Refresh ephemeral subscription window after waking from mobile background sleep
+        this._subscribe(state);
+      }
+    }
+  }
+
   publish(event, targetRelayUrls = null) {
     this._rememberId(event.id);
     const payload = JSON.stringify(['EVENT', event]);
