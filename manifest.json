@@ -1,0 +1,18 @@
+{
+  "name": "DecLoc Chat — Decentralized Local Chat",
+  "short_name": "DecLoc",
+  "description": "Decentralized, local-first, end-to-end encrypted group chat.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#4f46e5",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
