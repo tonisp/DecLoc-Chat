@@ -26,6 +26,7 @@ import {
   formatUserHandle,
   computeNameBlockHash,
   colorFromPubkey,
+  replayRoomGovernance,
 } from './crypto.js';
 import {
   loadSettings,
@@ -388,16 +389,32 @@ async function startApp() {
     onNotice: (key) => showToast(t(key), 4500),
   });
 
-  // Auto-join pending invite link if user opened one
+  // Auto-join pending invite link if user opened one (verify room exists & is not nuked/banned first!)
   if (pendingInvite) {
     const inv = pendingInvite;
     pendingInvite = null;
-    const chId = await joinOrCreateRoom(inv.name, inv.passphrase, {
+    const check = await verifyRoomOnRelays(inv.name, inv.passphrase, {
       relayMode: inv.relayMode || 'public',
       customRelay: inv.customRelay || null,
       creatorPubkey: inv.creatorPubkey || null,
     });
-    if (chId) selectRoom(chId);
+    if (check.status === 'already_joined' || check.status === 'exists') {
+      const chId = await joinOrCreateRoom(inv.name, inv.passphrase, {
+        relayMode: inv.relayMode || 'public',
+        customRelay: inv.customRelay || null,
+        creatorPubkey: inv.creatorPubkey || check.detectedCreator || null,
+        epochStartMs: check.epochStartMs || 0,
+        epochInitMs: check.epochInitMs || 0,
+      });
+      if (chId) selectRoom(chId);
+    } else {
+      showToast(getRoomVerifyErrorText(check.status), 5500);
+      if (settings.lastRoomId && roomsState.has(settings.lastRoomId)) {
+        selectRoom(settings.lastRoomId);
+      } else if (roomsState.size > 0) {
+        selectRoom([...roomsState.keys()][0]);
+      }
+    }
   } else if (settings.lastRoomId && roomsState.has(settings.lastRoomId)) {
     selectRoom(settings.lastRoomId);
   } else if (roomsState.size > 0) {
@@ -449,7 +466,7 @@ async function hydrateRoom(room) {
         }
         issuers.add(item.pubkey);
       }
-    } else if (item.type === 'gov' && typeof item.pubkey === 'string' && typeof item.action === 'string') {
+    } else if ((item.type === 'gov' || item.type === 'nuke') && typeof item.pubkey === 'string') {
       govEvents.set(item.id, item);
     } else if (item.type === 'archive' && typeof item.pubkey === 'string' && isValidHandleTag(item.lastTag)) {
       const archivedAtMs = typeof item.archivedAtMs === 'number' ? item.archivedAtMs : (item.createdAt || 0) * 1000;
@@ -470,7 +487,9 @@ async function hydrateRoom(room) {
     }
   }
 
+  const roomEpochStartMs = Number(room.epochStartMs || 0);
   const isPreArchive = (pubkey, tsMs) => {
+    if (roomEpochStartMs > 0 && tsMs <= roomEpochStartMs) return true;
     const arch = archiveEvents.get(pubkey);
     return Boolean(arch && tsMs <= arch.archivedAtMs);
   };
@@ -544,6 +563,7 @@ async function hydrateRoom(room) {
     nickEvents,
     archiveEvents,
     govEvents,
+    epochStartMs: roomEpochStartMs,
     creatorPubkey: room.creatorPubkey || null,
     admins: new Set(), // verified admin pubkeys (always includes creatorPubkey)
     bannedPubkeys: new Map(), // pubkey -> { by, tsMs, lastHandle }
@@ -568,10 +588,114 @@ async function hydrateRoom(room) {
   return state;
 }
 
+function getRoomVerifyErrorText(status) {
+  if (status === 'nuked') return t('errRoomNuked');
+  if (status === 'banned') return t('errRoomBanned');
+  if (status === 'offline') return t('errRelayUnreachable');
+  return t('errRoomNotFound');
+}
+
+// Cryptographically probe target relays to verify whether a room actually exists,
+// matches the derived AES-256-GCM key, has not been nuked by an admin, and has not banned this user.
+async function verifyRoomOnRelays(
+  roomName,
+  passphrase,
+  { relayMode = 'public', customRelay = null, creatorPubkey = null } = {}
+) {
+  const cleanName = String(roomName || '').trim();
+  if (!cleanName || !passphrase) return { status: 'not_found' };
+
+  const normCustom = relayMode === 'custom' ? normalizeRelayUrl(customRelay) : null;
+  const finalMode = relayMode === 'custom' && normCustom ? 'custom' : 'public';
+  const targetRelays = finalMode === 'custom' ? [normCustom] : getEnabledPublicRelays();
+
+  const secrets = await deriveRoomSecrets(cleanName, passphrase);
+  if (roomsState.has(secrets.channelId)) {
+    return { status: 'already_joined', channelId: secrets.channelId, secrets };
+  }
+
+  if (!pool) return { status: 'offline', channelId: secrets.channelId, secrets };
+
+  const myIdentity = await deriveRoomIdentity(activeMasterSeed, secrets.channelId);
+  const probe = await pool.probeChannel(secrets.channelId, targetRelays, {
+    timeoutMs: 5000,
+    limit: 100,
+  });
+
+  if (probe.respondedRelays === 0) {
+    return { status: 'offline', channelId: secrets.channelId, secrets };
+  }
+
+  // Decrypt all Schnorr-verified events with the derived room key
+  const decrypted = [];
+  for (const ev of probe.events) {
+    const payload = await decryptRoomPayload(secrets.aesKey, ev.pubkey, secrets.channelId, ev.content);
+    if (payload && typeof payload.t === 'string') {
+      decrypted.push({ ev, payload });
+    }
+  }
+
+  if (decrypted.length === 0) {
+    return { status: 'not_found', channelId: secrets.channelId, secrets };
+  }
+
+  // Replay signed Room Governance & Epoch timeline (handles nukes AND clean re-creation after a nuke!)
+  const govAndNuke = decrypted
+    .filter((d) => (d.payload.t === 'gov' && typeof d.payload.action === 'string') || d.payload.t === 'nuke')
+    .map((d) => ({
+      id: d.ev.id,
+      type: d.payload.t === 'nuke' ? 'nuke' : 'gov',
+      pubkey: String(d.ev.pubkey || '').toLowerCase(),
+      action: d.payload.t === 'nuke' ? 'nuke' : d.payload.action,
+      target: isHex64(d.payload.target) ? d.payload.target.toLowerCase() : null,
+      tsMs: typeof d.payload.ts === 'number' ? d.payload.ts : d.ev.created_at * 1000,
+    }));
+
+  const gov = replayRoomGovernance(govAndNuke, { pinnedCreatorPubkey: creatorPubkey });
+  const hasActiveNonNuke = decrypted.some((d) => {
+    if (d.payload.t === 'nuke') return false;
+    const ts = typeof d.payload.ts === 'number' ? d.payload.ts : d.ev.created_at * 1000;
+    return ts > gov.epochStartMs;
+  });
+
+  if (!gov.roomActive && gov.lastNukeMs > 0) {
+    return {
+      status: 'nuked',
+      channelId: secrets.channelId,
+      secrets,
+      lastNukeMs: gov.lastNukeMs,
+    };
+  }
+
+  if (!gov.roomActive && !hasActiveNonNuke) {
+    return { status: 'not_found', channelId: secrets.channelId, secrets };
+  }
+
+  if (gov.bannedPubkeys.has(myIdentity.pubkeyHex.toLowerCase())) {
+    return { status: 'banned', channelId: secrets.channelId, secrets };
+  }
+
+  return {
+    status: 'exists',
+    channelId: secrets.channelId,
+    secrets,
+    detectedCreator: gov.creatorPubkey,
+    epochStartMs: gov.epochStartMs,
+    epochInitMs: gov.epochInitMs,
+  };
+}
+
 async function joinOrCreateRoom(
   roomName,
   passphrase,
-  { relayMode = 'public', customRelay = null, isCreator = false, creatorPubkey = null } = {}
+  {
+    relayMode = 'public',
+    customRelay = null,
+    isCreator = false,
+    creatorPubkey = null,
+    epochStartMs = 0,
+    epochInitMs = 0,
+  } = {}
 ) {
   const cleanName = roomName.trim();
   if (!cleanName || !passphrase) return null;
@@ -600,6 +724,10 @@ async function joinOrCreateRoom(
       : isHex64(creatorPubkey)
         ? creatorPubkey.toLowerCase()
         : null;
+    const cleanEpochStart = Number(epochStartMs || 0);
+    const initTs = isCreator
+      ? Math.max(Date.now(), cleanEpochStart + 1000)
+      : Number(epochInitMs || 0);
     const roomObj = {
       channelId: secrets.channelId,
       name: cleanName,
@@ -607,6 +735,8 @@ async function joinOrCreateRoom(
       relayMode: finalMode,
       customRelay: finalMode === 'custom' ? normCustom : null,
       creatorPubkey: resolvedCreator,
+      epochStartMs: cleanEpochStart,
+      epochInitMs: initTs,
       joinedAt: Math.floor(Date.now() / 1000),
       lastActivity: Math.floor(Date.now() / 1000),
       lastReadAt: 0,
@@ -616,7 +746,7 @@ async function joinOrCreateRoom(
     state = await hydrateRoom(roomObj);
     syncSubscriptions();
     if (isCreator) {
-      await publishGovAction(state, 'init', null);
+      await publishGovAction(state, 'init', null, { tsOverride: initTs });
     }
   }
   renderRoomList();
@@ -706,6 +836,7 @@ function isMemberBanned(state, pubkey) {
 }
 
 function isBlockedByArchive(state, pubkey, tsMs) {
+  if (state?.epochStartMs && Number(tsMs || 0) <= state.epochStartMs) return true;
   if (isMemberBanned(state, pubkey)) return true;
   const arch = state?.archiveEvents?.get(pubkey);
   return Boolean(arch && Number(tsMs || 0) <= arch.archivedAtMs);
@@ -749,45 +880,20 @@ function rebuildRoomDirectory(state) {
   const channelId = state.room.channelId;
   const myPubkey = state.identity.pubkeyHex;
 
-  // 0. Replay signed Room Governance Chain (founding creator -> co-admins -> admin succession -> member blocks)
-  const sortedGov = [...(state.govEvents ? state.govEvents.values() : [])].sort(
-    (a, b) => (a.tsMs || 0) - (b.tsMs || 0) || String(a.id || '').localeCompare(String(b.id || ''))
-  );
-  const firstInit = sortedGov.find((g) => g.action === 'init' && isHex64(g.pubkey));
-  const pinnedCreator = isHex64(state.room?.creatorPubkey) ? state.room.creatorPubkey.toLowerCase() : null;
-  let creatorPubkey = firstInit ? firstInit.pubkey.toLowerCase() : pinnedCreator;
+  // 0. Replay signed Room Governance & Epoch Chain (handles creator, co-admins, succession, nukes & re-creation)
+  const gov = replayRoomGovernance([...(state.govEvents ? state.govEvents.values() : [])], {
+    pinnedCreatorPubkey: state.room?.creatorPubkey || null,
+    minEpochStartMs: Number(state.room?.epochStartMs || 0),
+  });
+  let creatorPubkey = gov.creatorPubkey;
+  const admins = gov.admins;
+  const bannedPubkeys = gov.bannedPubkeys;
+  const epochStartMs = Math.max(Number(state.room?.epochStartMs || 0), gov.epochStartMs || 0);
   if (creatorPubkey && !state.room.creatorPubkey) {
     state.room.creatorPubkey = creatorPubkey;
     saveRoom(state.room).catch(() => {});
   }
-  const admins = new Set();
-  if (creatorPubkey) admins.add(creatorPubkey);
-  if (pinnedCreator) admins.add(pinnedCreator);
-  const bannedPubkeys = new Map(); // pubkey -> { by, tsMs }
-
-  for (const g of sortedGov) {
-    const actor = String(g.pubkey || '').toLowerCase();
-    if (!admins.has(actor)) continue; // Ignore any forged governance event from a non-admin!
-    const target = isHex64(g.target) ? g.target.toLowerCase() : null;
-    if (g.action === 'grant_admin' && target && !bannedPubkeys.has(target)) {
-      admins.add(target);
-    } else if (g.action === 'transfer_admin' && target && !bannedPubkeys.has(target)) {
-      admins.add(target);
-      if (actor === creatorPubkey) {
-        creatorPubkey = target;
-      }
-      if (target !== actor) {
-        admins.delete(actor);
-      }
-    } else if (g.action === 'revoke_admin' && target && target !== creatorPubkey) {
-      admins.delete(target);
-    } else if (g.action === 'ban' && target && target !== creatorPubkey) {
-      admins.delete(target);
-      bannedPubkeys.set(target, { by: actor, tsMs: g.tsMs || Date.now() });
-    } else if (g.action === 'unban' && target) {
-      bannedPubkeys.delete(target);
-    }
-  }
+  state.epochStartMs = epochStartMs;
   state.creatorPubkey = creatorPubkey;
   state.admins = admins;
   state.bannedPubkeys = bannedPubkeys;
@@ -803,10 +909,12 @@ function rebuildRoomDirectory(state) {
   const members = new Map();
   const archivedMembers = new Map();
 
-  // 1. Seed archived tags in deterministic FIFO order (oldest archived first; older historical tags before lastTag)
-  const sortedArchives = [...state.archiveEvents.values()].sort(
-    (a, b) => (a.archivedAtMs || 0) - (b.archivedAtMs || 0) || String(a.id || '').localeCompare(String(b.id || ''))
-  );
+  // 1. Seed archived tags in deterministic FIFO order (skip any pre-nuke epoch archives!)
+  const sortedArchives = [...state.archiveEvents.values()]
+    .filter((a) => !epochStartMs || (a.archivedAtMs || 0) > epochStartMs)
+    .sort(
+      (a, b) => (a.archivedAtMs || 0) - (b.archivedAtMs || 0) || String(a.id || '').localeCompare(String(b.id || ''))
+    );
   for (const arch of sortedArchives) {
     const olderTags = (arch.reservedTags || []).filter((tg) => tg !== arch.lastTag);
     const orderedTags = [...olderTags, arch.lastTag];
@@ -1025,8 +1133,9 @@ function rebuildRoomDirectory(state) {
     });
   }
 
-  // 4. Archived members (departed & data-erased): ONLY show those not currently active, banned, or FIFO-recycled
+  // 4. Archived members (departed & data-erased): ONLY show current-epoch archives not currently active, banned, or FIFO-recycled
   for (const [pk, arch] of state.archiveEvents.entries()) {
+    if (epochStartMs && (arch.archivedAtMs || 0) <= epochStartMs) continue;
     if (!members.has(pk)) {
       admins.delete(pk);
       if (!bannedPubkeys.has(pk) && !recycledArchivePubkeys.has(pk)) {
@@ -1192,7 +1301,7 @@ async function scrubBannedMemberData(state, targetPubkey) {
   await saveRoom(state.room);
 }
 
-async function publishGovAction(state, action, targetPubkey = null) {
+async function publishGovAction(state, action, targetPubkey = null, { tsOverride = null } = {}) {
   if (!state) return null;
   const myPubkey = state.identity.pubkeyHex;
   if (action === 'init') {
@@ -1205,7 +1314,7 @@ async function publishGovAction(state, action, targetPubkey = null) {
   }
 
   const cleanTarget = isHex64(targetPubkey) ? targetPubkey.toLowerCase() : null;
-  const ts = Date.now();
+  const ts = typeof tsOverride === 'number' && tsOverride > 0 ? tsOverride : Date.now();
   const payload = {
     v: 1,
     t: 'gov',
@@ -1794,6 +1903,7 @@ async function toggleReaction(targetMsgId, emoji) {
     channelId: state.room.channelId,
     type: 'react',
     pubkey: ev.pubkey,
+    name: settings.name,
     target: targetMsgId,
     emoji,
     remove: alreadyReacted,
@@ -2099,8 +2209,32 @@ async function handleIncomingNostrEvent(ev, fromRelayUrl) {
   }
 
   if (payload.t === 'nuke') {
+    const nukeTs = typeof payload.ts === 'number' ? payload.ts : ev.created_at * 1000;
+    const myEpochStart = Number(state.room.epochStartMs || 0);
+    const myEpochInit = Number(state.room.epochInitMs || 0);
+
+    // Ignore stale nuke tombstones left on public/SQLite relays from BEFORE this room was cleanly re-created!
+    if ((myEpochStart > 0 && nukeTs <= myEpochStart) || (myEpochInit > 0 && nukeTs < myEpochInit)) {
+      if (!state.govEvents.has(ev.id)) {
+        const oldNuke = {
+          id: ev.id,
+          channelId,
+          type: 'nuke',
+          pubkey: ev.pubkey,
+          action: 'nuke',
+          target: null,
+          tsMs: nukeTs,
+          createdAt: ev.created_at,
+        };
+        state.govEvents.set(ev.id, oldNuke);
+        await saveMessage(oldNuke);
+        rebuildRoomDirectory(state);
+      }
+      return;
+    }
+
     rebuildRoomDirectory(state);
-    if (!isRoomAdmin(state, ev.pubkey)) return;
+    if (!isRoomAdmin(state, ev.pubkey) && state.admins.size > 0) return;
     const rName = state.room.name;
     await leaveRoomByIdLocally(channelId);
     showToast(t('roomNukedToast', rName), 5000);
@@ -2108,6 +2242,8 @@ async function handleIncomingNostrEvent(ev, fromRelayUrl) {
   }
 
   if (payload.t === 'rekey' && payload.envelopes && typeof payload.envelopes === 'object') {
+    const rekeyTs = typeof payload.ts === 'number' ? payload.ts : ev.created_at * 1000;
+    if (state.epochStartMs && rekeyTs <= state.epochStartMs) return;
     rebuildRoomDirectory(state);
     if (!isRoomAdmin(state, ev.pubkey)) return;
     const myPubkey = state.identity.pubkeyHex;
@@ -2207,6 +2343,7 @@ async function handleIncomingNostrEvent(ev, fromRelayUrl) {
       channelId,
       type: 'react',
       pubkey: ev.pubkey,
+      name: typeof payload.name === 'string' ? payload.name.trim().slice(0, 32) : '',
       target: payload.target,
       emoji: payload.emoji.slice(0, 8),
       remove: Boolean(payload.remove),
@@ -2387,8 +2524,9 @@ function applyReactionInMemory(reactMap, item) {
   }
   const prev = byUser.get(item.pubkey);
   const tsVal = item.tsMs ?? item.createdAt * 1000;
+  const cleanName = typeof item.name === 'string' && item.name.trim() ? item.name.trim().slice(0, 32) : (prev?.name || '');
   if (!prev || tsVal >= prev.ts) {
-    byUser.set(item.pubkey, { active: !item.remove, ts: tsVal });
+    byUser.set(item.pubkey, { active: !item.remove, ts: tsVal, name: cleanName });
   }
 }
 
@@ -2845,20 +2983,23 @@ function renderMessages(scrollToBottom) {
     wrap.append(bubble, actions);
     row.appendChild(wrap);
 
-    // Reactions display
+    // Reactions display (click any reaction pill to see exactly who added which emoji)
     const byEmoji = state.reactions.get(m.id);
     if (byEmoji) {
       const pills = [];
       for (const [emoji, byUser] of byEmoji.entries()) {
         let count = 0;
         let mine = false;
+        const names = [];
         for (const [pk, st] of byUser.entries()) {
           if (st.active) {
             count++;
             if (pk === state.identity.pubkeyHex) mine = true;
+            const actor = resolveReactionActor(state, pk, st.name);
+            names.push(actor.handle);
           }
         }
-        if (count > 0) pills.push({ emoji, count, mine });
+        if (count > 0) pills.push({ emoji, count, mine, names });
       }
       if (pills.length > 0) {
         const reactBar = document.createElement('div');
@@ -2868,7 +3009,8 @@ function renderMessages(scrollToBottom) {
           pill.type = 'button';
           pill.className = 'reaction-pill' + (p.mine ? ' reacted' : '');
           pill.textContent = `${p.emoji} ${p.count}`;
-          pill.addEventListener('click', () => toggleReaction(m.id, p.emoji));
+          pill.title = `${p.emoji} ${p.names.join(', ')}`;
+          pill.addEventListener('click', () => openReactionsModal(state.room.channelId, m.id, 'ALL'));
           reactBar.appendChild(pill);
         }
         row.appendChild(reactBar);
@@ -3612,6 +3754,182 @@ function openSeenModal(viewers) {
     list.appendChild(item);
   }
   showOverlay('seenModal');
+}
+
+function resolveReactionActor(state, pubkey, fallbackName = '') {
+  if (state.archivedMembers?.has(pubkey)) {
+    const arch = state.archivedMembers.get(pubkey);
+    return {
+      handle: `archived-${arch.lastTag}`,
+      letter: '#',
+      isArchived: true,
+      isMe: false,
+      isAdmin: false,
+    };
+  }
+  const isMe = pubkey === state.identity.pubkeyHex;
+  const chain = state.nameChains?.get(pubkey) || [];
+  const rawName =
+    (isMe && settings.name) ||
+    state.members?.get(pubkey)?.name ||
+    state.presence?.get(pubkey)?.name ||
+    (chain.length > 0 ? chain[chain.length - 1].name : '') ||
+    state.readReceipts?.get(pubkey)?.name ||
+    fallbackName ||
+    '?';
+  const cleanName = String(rawName || '?').trim().slice(0, 32) || '?';
+  return {
+    handle: getRoomHandle(state, cleanName, pubkey),
+    letter: (cleanName[0] || '?').toUpperCase(),
+    isArchived: false,
+    isMe,
+    isAdmin: isRoomAdmin(state, pubkey),
+  };
+}
+
+function openReactionsModal(channelId, msgId, filterEmoji = 'ALL') {
+  const state = roomsState.get(channelId);
+  if (!state) return;
+  const byEmoji = state.reactions.get(msgId);
+  const emojiGroups = [];
+  const allItems = [];
+
+  if (byEmoji) {
+    for (const [emoji, byUser] of byEmoji.entries()) {
+      const entries = [];
+      for (const [pk, st] of byUser.entries()) {
+        if (!st.active) continue;
+        const actor = resolveReactionActor(state, pk, st.name);
+        const item = { emoji, pubkey: pk, ts: st.ts || 0, ...actor };
+        entries.push(item);
+        allItems.push(item);
+      }
+      if (entries.length > 0) {
+        emojiGroups.push({ emoji, count: entries.length, entries });
+      }
+    }
+  }
+
+  if (allItems.length === 0) {
+    hideOverlay('reactionsModal');
+    return;
+  }
+
+  const activeFilter =
+    filterEmoji !== 'ALL' && emojiGroups.some((g) => g.emoji === filterEmoji)
+      ? filterEmoji
+      : 'ALL';
+
+  const tabsEl = $('reactionsTabs');
+  tabsEl.textContent = '';
+
+  const allTab = document.createElement('button');
+  allTab.type = 'button';
+  allTab.className = 'reaction-tab' + (activeFilter === 'ALL' ? ' active' : '');
+  allTab.textContent = t('reactionsAllTab', allItems.length);
+  allTab.addEventListener('click', () => openReactionsModal(channelId, msgId, 'ALL'));
+  tabsEl.appendChild(allTab);
+
+  for (const g of emojiGroups) {
+    const tab = document.createElement('button');
+    tab.type = 'button';
+    tab.className = 'reaction-tab' + (activeFilter === g.emoji ? ' active' : '');
+    tab.textContent = `${g.emoji} ${g.count}`;
+    tab.addEventListener('click', () => openReactionsModal(channelId, msgId, g.emoji));
+    tabsEl.appendChild(tab);
+  }
+
+  const shown = (
+    activeFilter === 'ALL'
+      ? allItems
+      : emojiGroups.find((g) => g.emoji === activeFilter)?.entries || []
+  ).sort((a, b) => {
+    if (a.isMe !== b.isMe) return a.isMe ? -1 : 1;
+    return (b.ts || 0) - (a.ts || 0);
+  });
+
+  const listEl = $('reactionsList');
+  listEl.textContent = '';
+
+  for (const r of shown) {
+    const row = document.createElement('div');
+    row.className = 'reaction-user-row';
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'online-row online-row-btn';
+    if (!r.isArchived) {
+      btn.title = t('clickForHistoryHint');
+      btn.addEventListener('click', () => {
+        hideOverlay('reactionsModal');
+        openUserHistoryModal(channelId, r.pubkey);
+      });
+    } else {
+      btn.disabled = true;
+    }
+
+    const av = document.createElement('div');
+    av.className = 'online-avatar' + (r.isArchived ? ' archived-avatar' : '');
+    if (!r.isArchived) av.style.background = colorFromPubkey(r.pubkey);
+    av.textContent = r.letter;
+
+    const info = document.createElement('div');
+    const top = document.createElement('div');
+    top.className = 'member-row-top';
+    const nm = document.createElement('span');
+    nm.textContent = r.isMe ? `${r.handle} (${t('youTag')})` : r.handle;
+    top.appendChild(nm);
+    if (r.isAdmin) {
+      const admPill = document.createElement('span');
+      admPill.className = 'admin-badge';
+      admPill.textContent = `👑 ${t('adminTag')}`;
+      top.appendChild(admPill);
+    }
+
+    const tm = document.createElement('div');
+    tm.className = 'muted small';
+    tm.textContent = r.ts ? formatSeenTime(r.ts) : '';
+    info.append(top, tm);
+    btn.append(av, info);
+
+    const emojiSpan = document.createElement('span');
+    emojiSpan.className = 'reaction-row-emoji';
+    emojiSpan.textContent = r.emoji;
+
+    row.append(btn, emojiSpan);
+
+    if (r.isMe) {
+      const remBtn = document.createElement('button');
+      remBtn.type = 'button';
+      remBtn.className = 'btn btn-ghost btn-xs';
+      remBtn.textContent = t('reactionRemoveBtn');
+      remBtn.addEventListener('click', async () => {
+        await toggleReaction(msgId, r.emoji);
+        openReactionsModal(channelId, msgId, activeFilter);
+      });
+      row.appendChild(remBtn);
+    }
+
+    listEl.appendChild(row);
+  }
+
+  // When viewing a specific emoji tab that the user hasn't reacted with yet, offer 1-tap "+ Add my reaction"
+  if (activeFilter !== 'ALL') {
+    const myEntry = byEmoji?.get(activeFilter)?.get(state.identity.pubkeyHex);
+    if (!myEntry || !myEntry.active) {
+      const addBtn = document.createElement('button');
+      addBtn.type = 'button';
+      addBtn.className = 'btn btn-secondary btn-sm reaction-modal-add-btn';
+      addBtn.textContent = t('reactionAddMineBtn', activeFilter);
+      addBtn.addEventListener('click', async () => {
+        await toggleReaction(msgId, activeFilter);
+        openReactionsModal(channelId, msgId, activeFilter);
+      });
+      listEl.appendChild(addBtn);
+    }
+  }
+
+  showOverlay('reactionsModal');
 }
 
 function openUserHistoryModal(channelId, pubkey) {
@@ -4590,13 +4908,22 @@ function bindEvents() {
     }
 
     const btn = $('createRoomSubmitBtn');
+    $('createRoomError').classList.add('hidden');
     btn.disabled = true;
-    btn.textContent = t('derivingKeys');
+    btn.textContent = t('checkingRoom');
     try {
+      const check = await verifyRoomOnRelays(name, pass, { relayMode, customRelay });
+      if (check.status === 'already_joined' || check.status === 'exists') {
+        $('createRoomError').textContent = t('errRoomAlreadyExists');
+        $('createRoomError').classList.remove('hidden');
+        return;
+      }
+      btn.textContent = t('derivingKeys');
       const chId = await joinOrCreateRoom(name, pass, {
         relayMode,
         customRelay,
         isCreator: true,
+        epochStartMs: check.status === 'nuked' ? check.lastNukeMs || 0 : 0,
       });
       hideOverlay('createRoomModal');
       if (chId) {
@@ -4671,13 +4998,27 @@ function bindEvents() {
     }
 
     const btn = $('joinRoomSubmitBtn');
+    $('joinRoomError').classList.add('hidden');
     btn.disabled = true;
-    btn.textContent = t('derivingKeys');
+    btn.textContent = t('checkingRoom');
     try {
-      const chId = await joinOrCreateRoom(name, pass, {
+      const check = await verifyRoomOnRelays(name, pass, {
         relayMode,
         customRelay,
         creatorPubkey,
+      });
+      if (check.status !== 'already_joined' && check.status !== 'exists') {
+        $('joinRoomError').textContent = getRoomVerifyErrorText(check.status);
+        $('joinRoomError').classList.remove('hidden');
+        return;
+      }
+      btn.textContent = t('derivingKeys');
+      const chId = await joinOrCreateRoom(name, pass, {
+        relayMode,
+        customRelay,
+        creatorPubkey: creatorPubkey || check.detectedCreator || null,
+        epochStartMs: check.epochStartMs || 0,
+        epochInitMs: check.epochInitMs || 0,
       });
       hideOverlay('joinRoomModal');
       if (chId) {
@@ -5296,14 +5637,25 @@ function bindEvents() {
     window.location.reload();
   });
 
-  // Handle opening an invite hash in an already open tab
+  // Handle opening an invite hash in an already open tab (verify room exists & is not nuked/banned first!)
   window.addEventListener('hashchange', async () => {
     const inv = consumeInviteFromUrl();
     if (!inv || !settings.name) return;
-    const chId = await joinOrCreateRoom(inv.name, inv.passphrase, {
+    const check = await verifyRoomOnRelays(inv.name, inv.passphrase, {
       relayMode: inv.relayMode || 'public',
       customRelay: inv.customRelay || null,
       creatorPubkey: inv.creatorPubkey || null,
+    });
+    if (check.status !== 'already_joined' && check.status !== 'exists') {
+      showToast(getRoomVerifyErrorText(check.status), 5500);
+      return;
+    }
+    const chId = await joinOrCreateRoom(inv.name, inv.passphrase, {
+      relayMode: inv.relayMode || 'public',
+      customRelay: inv.customRelay || null,
+      creatorPubkey: inv.creatorPubkey || check.detectedCreator || null,
+      epochStartMs: check.epochStartMs || 0,
+      epochInitMs: check.epochInitMs || 0,
     });
     if (chId) selectRoom(chId);
   });

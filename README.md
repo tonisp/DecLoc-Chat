@@ -49,9 +49,16 @@ If you just want to use the app with non-technical friends or family:
 3. **Create a room:** click **+ New room**, type a room name (e.g. `Family`), keep the auto-generated passphrase (or write your own), and choose **Public relays** or **Custom relay**.
 4. **Invite friends:** click **Invite → Copy invite link** (or **Share…** on mobile) and send the link to your friend.
 5. **Your friend clicks the link**, types their name, and is immediately inside the encrypted group chat!
-6. **Install like an app (optional):**
-   * **Android (Chrome):** tap the `⋮` menu → **Add to Home screen** / **Install app**.
-   * **iPhone (Safari):** tap the Share icon (`↑`) → **Add to Home Screen**.
+6. **Install as a standalone app (PWA — recommended for phones):**
+   * **Recommended browser:** open the link in **Google Chrome** if available (Chrome gives the smoothest standalone app installation, lock-screen Push notifications, and WebRTC video calls).
+   * **Android (Google Chrome — recommended):**
+     1. Open the chat link in **Chrome** and tap the **`⋮`** menu (top right).
+     2. Tap **Add to Home screen** or **Install app**.
+     3. When prompted to choose between installing an app or creating a browser shortcut, choose **Install** *(install as a standalone app — **not** "Create shortcut")*.
+     4. Confirm **Install** — DecLoc now appears as a dedicated full-screen app on your home screen/app drawer with automatic notification alerts on launch.
+   * **Android (Edge / Brave / Samsung Internet):** open the browser menu (`⋮` or `≡`) → **Install app** / **Add page to → Home screen**.
+   * **iPhone / iPad (Safari):** open the link in **Safari** → tap the **Share** icon (`↑`) at the bottom → scroll down and tap **Add to Home Screen** → **Add**.
+   * **Desktop (Chrome / Edge):** click the **Install** icon (`⊕` / screen-with-arrow) on the right side of the address bar, or open `⋮` → **Cast, save, and share → Install DecLoc Chat…**.
 
 > **Tip — two different passwords:**
 > * **Room passphrase** = shared with everyone in that room (the key to enter and decrypt that room).
@@ -341,9 +348,16 @@ Kui tahad äppi kasutada sõprade või perega:
 3. **Loo jututuba:** vajuta **+ Uus tuba**, pane toale nimi (nt `Pere`), jäta genereeritud parool alles (või kirjuta enda oma) ja vali kas **Avalikud relay'd** või **Enda relay**.
 4. **Kutsu sõbrad:** vajuta toas **Kutsu → Kopeeri kutselink** (mobiilis **Jaga…**) ja saada link sõbrale.
 5. **Sõber vajutab lingile**, sisestab oma nime ja on kohe privaatses grupivestluses!
-6. **Lisa telefonis avakuvale (nagu päris äpp):**
-   * **Android (Chrome):** vajuta paremal üleval `⋮` → **Lisa avakuvale** / **Installi rakendus**.
-   * **iPhone (Safari):** vajuta all jagamisikooni (`↑`) → **Lisa avakuvale**.
+6. **Paigalda eraldi rakendusena (PWA — telefonis väga soovitatav):**
+   * **Soovitatav brauser:** kui telefonis on olemas **Google Chrome**, soovitame paigaldada rakenduse just **Chrome'iga** (kõige parem eraldi rakendusena paigaldamise, lukustatud ekraani push-teavituste ja WebRTC videokõnede tugi).
+   * **Android (Google Chrome — soovitatav):**
+     1. Ava chati link **Chrome'is** ja vajuta paremal üleval **`⋮`** menüünuppu.
+     2. Vali **Lisa avakuvale** (*Add to Home screen*) või **Installi rakendus** (*Install app*).
+     3. Kui Chrome küsib valikut *„Installi“* vs *„Loo otsetee“* (brauseriviide), vali kindlasti **Installi** (*Install* — eraldi täisekraani rakendusena, **mitte** tavalise brauseriviitena!).
+     4. Kinnita **Installi** — DecLoc ilmub nüüd telefoni rakenduste hulka eraldi äpina (ilma brauseriribata ja automaatsete teavitustega).
+   * **Android (Edge / Brave / Samsung Internet):** ava brauseri menüü (`⋮` või `≡`) → **Installi rakendus** / **Lisa leht → Avakuva**.
+   * **iPhone / iPad (Safari):** ava link **Safaris** → vajuta all jagamisikooni (`↑`) → keri alla ja vali **Lisa avakuvale** (*Add to Home Screen*) → **Lisa**.
+   * **Arvuti (Chrome / Edge):** vajuta aadressiriba paremas otsas olevat **paigaldamise ikooni** (`⊕` / ekraan noolega) või `⋮` → **Ülekandmine, salvestamine ja jagamine → Installi DecLoc Chat…**.
 
 > **NB! Kaks erinevat parooli:**
 > * **Toa salaparool** = ühine kõigile selles toas olijatele (võti tuppa sisenemiseks ja sõnumite dekrüpteerimiseks).

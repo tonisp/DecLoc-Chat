@@ -826,3 +826,127 @@ test('Room Creator & Admin Governance: init creator, grant co-admin, ban & physi
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+test('RelayPool.probeChannel verifies room existence, rejects wrong credentials & nuked rooms, flushes connecting outbox, and preserves seenIds', async () => {
+  const dataDir = makeTempDir();
+  const srv = await createDecLocServer({ port: 0, host: '127.0.0.1', dataDir });
+  const info = await srv.start();
+
+  try {
+    const realRoom = await deriveRoomSecrets('Päris Tuba', 'oige-parool-123');
+    const wrongRoom = await deriveRoomSecrets('Päris Tuba', 'vale-parool-999');
+    const creator = await deriveRoomIdentity(generateMasterSeed(), realRoom.channelId);
+
+    // 1. Publish init event immediately on a newly created pool while WebSocket is still CONNECTING -> outbox flushes on open!
+    const creatorPool = new RelayPool([info.wsUrl]);
+    const initEv = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [
+          ['e', realRoom.channelId, '', 'root'],
+          ['d_admin_init', '1'],
+        ],
+        content: await encryptRoomPayload(realRoom.aesKey, creator.pubkeyHex, realRoom.channelId, {
+          v: 1,
+          t: 'gov',
+          action: 'init',
+          target: null,
+          ts: Date.now(),
+        }),
+      },
+      creator.privKeyBytes
+    );
+    creatorPool.publish(initEv, [info.wsUrl]);
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(srv.store.count(), 1);
+
+    // 2. Cold (unconnected) joiner pool probes WRONG room credentials -> respondedRelays: 1, events: []
+    const joinerPool = new RelayPool([]);
+    const wrongProbe = await joinerPool.probeChannel(wrongRoom.channelId, [info.wsUrl], { timeoutMs: 2000 });
+    assert.equal(wrongProbe.respondedRelays, 1);
+    assert.equal(wrongProbe.events.length, 0);
+
+    // 3. Cold joiner pool probes REAL room credentials -> finds verified init event & decrypts cleanly
+    const realProbe = await joinerPool.probeChannel(realRoom.channelId, [info.wsUrl], { timeoutMs: 2000 });
+    assert.equal(realProbe.respondedRelays, 1);
+    assert.equal(realProbe.events.length, 1);
+    assert.equal(realProbe.events[0].id, initEv.id);
+    const decInit = await decryptRoomPayload(
+      realRoom.aesKey,
+      realProbe.events[0].pubkey,
+      realRoom.channelId,
+      realProbe.events[0].content
+    );
+    assert.equal(decInit.t, 'gov');
+    assert.equal(decInit.action, 'init');
+
+    // 4. Probing on an already-OPEN pooled WebSocket also works and does NOT pollute seenIds!
+    const openProbe = await creatorPool.probeChannel(realRoom.channelId, [info.wsUrl], { timeoutMs: 2000 });
+    assert.equal(openProbe.respondedRelays, 1);
+    assert.equal(openProbe.events.length, 1);
+    assert.equal(joinerPool.seenIds.has(initEv.id), false);
+
+    // 5. After admin nukes the room, probeChannel returns ONLY the signed nuke tombstone
+    const nukeEv = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [
+          ['e', realRoom.channelId, '', 'root'],
+          ['d_room_nuke', '1'],
+        ],
+        content: await encryptRoomPayload(realRoom.aesKey, creator.pubkeyHex, realRoom.channelId, {
+          v: 1,
+          t: 'nuke',
+          ts: Date.now(),
+        }),
+      },
+      creator.privKeyBytes
+    );
+    creatorPool.publish(nukeEv, [info.wsUrl]);
+    await new Promise((r) => setTimeout(r, 120));
+
+    const nukedProbe = await joinerPool.probeChannel(realRoom.channelId, [info.wsUrl], { timeoutMs: 2000 });
+    assert.equal(nukedProbe.respondedRelays, 1);
+    assert.equal(nukedProbe.events.length, 1);
+    const decNuke = await decryptRoomPayload(
+      realRoom.aesKey,
+      nukedProbe.events[0].pubkey,
+      realRoom.channelId,
+      nukedProbe.events[0].content
+    );
+    assert.equal(decNuke.t, 'nuke');
+    assert.equal(srv.store.isRoomAdmin(realRoom.channelId, creator.pubkeyHex), false);
+
+    // 6. After nuke, another user can cleanly re-create the SAME room name+passphrase on SQLite relay!
+    const creator2 = await deriveRoomIdentity(generateMasterSeed(), realRoom.channelId);
+    const reInitEv = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [
+          ['e', realRoom.channelId, '', 'root'],
+          ['d_admin_init', '1'],
+        ],
+        content: await encryptRoomPayload(realRoom.aesKey, creator2.pubkeyHex, realRoom.channelId, {
+          v: 1,
+          t: 'gov',
+          action: 'init',
+          target: null,
+          ts: Date.now() + 2000,
+        }),
+      },
+      creator2.privKeyBytes
+    );
+    creatorPool.publish(reInitEv, [info.wsUrl]);
+    await new Promise((r) => setTimeout(r, 120));
+
+    assert.equal(srv.store.isRoomCreator(realRoom.channelId, creator2.pubkeyHex), true);
+    assert.equal(srv.store.isRoomAdmin(realRoom.channelId, creator2.pubkeyHex), true);
+    assert.equal(srv.store.isRoomAdmin(realRoom.channelId, creator.pubkeyHex), false);
+
+    creatorPool.destroy();
+    joinerPool.destroy();
+  } finally {
+    await srv.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});

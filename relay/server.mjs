@@ -109,8 +109,10 @@ async function createEventStore(dataDir) {
     );
     const removeAdminStmt = db.prepare(`DELETE FROM room_admins WHERE channel_id = ? AND pubkey = ? AND is_creator = 0`);
     const forceRemoveAdminStmt = db.prepare(`DELETE FROM room_admins WHERE channel_id = ? AND pubkey = ?`);
+    const clearChannelAdminsStmt = db.prepare(`DELETE FROM room_admins WHERE channel_id = ?`);
     const addBanStmt = db.prepare(`INSERT OR IGNORE INTO room_bans (channel_id, pubkey) VALUES (?, ?)`);
     const removeBanStmt = db.prepare(`DELETE FROM room_bans WHERE channel_id = ? AND pubkey = ?`);
+    const clearChannelBansStmt = db.prepare(`DELETE FROM room_bans WHERE channel_id = ?`);
     const isBannedStmt = db.prepare(`SELECT 1 AS banned FROM room_bans WHERE channel_id = ? AND pubkey = ?`);
 
     function rowToEvent(row) {
@@ -211,6 +213,8 @@ async function createEventStore(dataDir) {
       nukeRoomExcept(channelId, keepEventId) {
         if (!channelId) return 0;
         const info = deleteChannelExceptStmt.run(channelId, keepEventId || '');
+        clearChannelAdminsStmt.run(channelId);
+        clearChannelBansStmt.run(channelId);
         return Number(info.changes || 0);
       },
       query(filter) {
@@ -377,6 +381,8 @@ async function createEventStore(dataDir) {
             deleted++;
           }
         }
+        roomAdmins.delete(channelId);
+        roomBans.delete(channelId);
         if (deleted > 0) rewriteAll();
         return deleted;
       },

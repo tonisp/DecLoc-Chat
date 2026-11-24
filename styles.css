@@ -1182,6 +1182,55 @@ input:focus, textarea:focus, select:focus {
   background: var(--accent-soft);
 }
 
+.reactions-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.reaction-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.reaction-tab:hover { background: var(--bg-hover); color: var(--text); }
+.reaction-tab.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.reaction-user-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.reaction-user-row .online-row-btn {
+  flex: 1;
+  min-width: 0;
+}
+
+.reaction-row-emoji {
+  font-size: 1.25rem;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.reaction-modal-add-btn {
+  margin-top: 8px;
+  width: 100%;
+}
+
 .msg-highlight .msg-bubble {
   box-shadow: 0 0 0 3px var(--accent);
   transition: box-shadow 0.3s;

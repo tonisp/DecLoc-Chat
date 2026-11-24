@@ -30,6 +30,7 @@ import {
   decodeInviteHash,
   encryptForPeer,
   decryptFromPeer,
+  replayRoomGovernance,
 } from '../js/crypto.js';
 import { EMOJI_CATEGORIES, searchEmojis } from '../js/emojis.js';
 
@@ -439,4 +440,62 @@ test('Secp256k1 ECDH + AES-256-GCM peer-sealed rekey envelopes & creatorPubkey i
   });
   const parsedInvite = decodeInviteHash(urlWithCreator.slice(urlWithCreator.indexOf('#')));
   assert.equal(parsedInvite.creatorPubkey, admin.pubkeyHex);
+});
+
+test('Room Governance Epochs: block duplicate init while active, release name+passphrase on nuke, and allow clean re-creation on public relays', async () => {
+  const room = await deriveRoomSecrets('Pere', 'sama-parool-123');
+  const alice = (await deriveRoomIdentity(generateMasterSeed(), room.channelId)).pubkeyHex;
+  const bob = (await deriveRoomIdentity(generateMasterSeed(), room.channelId)).pubkeyHex;
+  const troll = (await deriveRoomIdentity(generateMasterSeed(), room.channelId)).pubkeyHex;
+
+  // Epoch 1: Alice creates room, Bob's duplicate init is ignored, Alice bans Bob, Troll's forged nuke is ignored
+  const epoch1Events = [
+    { id: 'e1', type: 'gov', action: 'init', pubkey: alice, target: null, tsMs: 1000 },
+    { id: 'e2', type: 'gov', action: 'init', pubkey: bob, target: null, tsMs: 1002 },
+    { id: 'e3', type: 'gov', action: 'ban', pubkey: alice, target: bob, tsMs: 1005 },
+    { id: 'e4', type: 'nuke', action: 'nuke', pubkey: troll, target: null, tsMs: 1008 },
+  ];
+  const st1 = replayRoomGovernance(epoch1Events);
+  assert.equal(st1.roomActive, true);
+  assert.equal(st1.creatorPubkey, alice);
+  assert.equal(st1.admins.has(alice), true);
+  assert.equal(st1.admins.has(bob), false);
+  assert.equal(st1.bannedPubkeys.has(bob), true);
+  assert.equal(st1.lastNukeMs, 0);
+
+  // Alice nukes the room at T=1010 -> room is now inactive & released for re-creation!
+  const afterNukeEvents = [
+    ...epoch1Events,
+    { id: 'e5', type: 'nuke', action: 'nuke', pubkey: alice, target: null, tsMs: 1010 },
+  ];
+  const stNuked = replayRoomGovernance(afterNukeEvents);
+  assert.equal(stNuked.roomActive, false);
+  assert.equal(stNuked.lastNukeMs, 1010);
+  assert.equal(stNuked.epochStartMs, 1010);
+  assert.equal(stNuked.admins.size, 0);
+  assert.equal(stNuked.bannedPubkeys.size, 0);
+
+  // Epoch 2: Bob re-creates the SAME room name+passphrase at T=2000 (even though old public-relay events remain!)
+  // Old admin Alice tries to nuke Bob's new room at T=2005 -> IGNORED!
+  const epoch2Events = [
+    ...afterNukeEvents,
+    { id: 'e6', type: 'gov', action: 'init', pubkey: bob, target: null, tsMs: 2000 },
+    { id: 'e7', type: 'nuke', action: 'nuke', pubkey: alice, target: null, tsMs: 2005 },
+  ];
+  const st2 = replayRoomGovernance(epoch2Events);
+  assert.equal(st2.roomActive, true);
+  assert.equal(st2.creatorPubkey, bob);
+  assert.equal(st2.admins.has(bob), true);
+  assert.equal(st2.admins.has(alice), false);
+  assert.equal(st2.bannedPubkeys.size, 0);
+  assert.equal(st2.epochStartMs, 1010); // all pre-1010 messages/nukes/archives are cleanly excluded!
+  assert.equal(st2.epochInitMs, 2000);
+
+  // Bob nukes Epoch 2 at T=2010 -> released once again!
+  const st2Nuked = replayRoomGovernance([
+    ...epoch2Events,
+    { id: 'e8', type: 'nuke', action: 'nuke', pubkey: bob, target: null, tsMs: 2010 },
+  ]);
+  assert.equal(st2Nuked.roomActive, false);
+  assert.equal(st2Nuked.lastNukeMs, 2010);
 });

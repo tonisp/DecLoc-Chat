@@ -848,3 +848,110 @@ export function colorFromPubkey(pubkeyHex) {
   const hue = hash % 360;
   return `hsl(${hue}, 72%, 58%)`;
 }
+
+// Deterministic Room Governance & Epoch Replay:
+// Replays signed `gov` (`init`, `grant_admin`, `transfer_admin`, `revoke_admin`, `ban`, `unban`)
+// and `nuke` events in chronological order. A valid admin `nuke` ends the room epoch and resets
+// admins/bans/history cutoff (`lastNukeMs`), allowing a fresh `init` with `tsMs > lastNukeMs`
+// to cleanly re-create a room with the same name & passphrase (on both public and custom relays)
+// while strictly rejecting duplicate `init` attempts while a room epoch is active.
+export function replayRoomGovernance(events, { pinnedCreatorPubkey = null, minEpochStartMs = 0 } = {}) {
+  const isHex64Local = (s) => typeof s === 'string' && /^[0-9a-f]{64}$/i.test(s);
+  const pinned = isHex64Local(pinnedCreatorPubkey) ? pinnedCreatorPubkey.toLowerCase() : null;
+
+  const sorted = [...(Array.isArray(events) ? events : [])].sort(
+    (a, b) => (Number(a.tsMs || 0) - Number(b.tsMs || 0)) || String(a.id || '').localeCompare(String(b.id || ''))
+  );
+
+  let roomActive = false;
+  let epochStartMs = Number(minEpochStartMs || 0);
+  let epochInitMs = 0;
+  let lastNukeMs = 0;
+  let creatorPubkey = null;
+  let admins = new Set();
+  let bannedPubkeys = new Map(); // pubkey -> { by, tsMs }
+
+  for (const ev of sorted) {
+    const actor = isHex64Local(ev?.pubkey) ? ev.pubkey.toLowerCase() : null;
+    if (!actor) continue;
+    const ts = Number(ev.tsMs || 0);
+    const kind = ev.type === 'nuke' ? 'nuke' : 'gov';
+
+    if (kind === 'nuke') {
+      const validNuke =
+        (roomActive && admins.has(actor)) ||
+        (!roomActive && admins.size === 0 && ts > epochInitMs) ||
+        (pinned && actor === pinned && ts > epochStartMs);
+      if (!validNuke) continue;
+      roomActive = false;
+      lastNukeMs = Math.max(lastNukeMs, ts);
+      epochStartMs = Math.max(epochStartMs, ts);
+      creatorPubkey = null;
+      admins = new Set();
+      bannedPubkeys = new Map();
+      continue;
+    }
+
+    const action = ev.action;
+    const target = isHex64Local(ev.target) ? ev.target.toLowerCase() : null;
+
+    if (action === 'init') {
+      if (!roomActive && ts > lastNukeMs) {
+        roomActive = true;
+        epochStartMs = Math.max(epochStartMs, lastNukeMs);
+        epochInitMs = ts;
+        creatorPubkey = actor;
+        admins = new Set([actor]);
+        bannedPubkeys = new Map();
+      }
+      continue;
+    }
+
+    if (!roomActive) {
+      if (pinned && actor === pinned && ts > lastNukeMs) {
+        roomActive = true;
+        epochStartMs = Math.max(epochStartMs, lastNukeMs);
+        creatorPubkey = pinned;
+        admins = new Set([pinned]);
+      } else {
+        continue;
+      }
+    }
+
+    if (!admins.has(actor)) continue;
+
+    if (action === 'grant_admin' && target && !bannedPubkeys.has(target)) {
+      admins.add(target);
+    } else if (action === 'transfer_admin' && target && !bannedPubkeys.has(target)) {
+      admins.add(target);
+      if (actor === creatorPubkey) {
+        creatorPubkey = target;
+      }
+      if (target !== actor) {
+        admins.delete(actor);
+      }
+    } else if (action === 'revoke_admin' && target && target !== creatorPubkey) {
+      admins.delete(target);
+    } else if (action === 'ban' && target && target !== creatorPubkey) {
+      admins.delete(target);
+      bannedPubkeys.set(target, { by: actor, tsMs: ts || Date.now() });
+    } else if (action === 'unban' && target) {
+      bannedPubkeys.delete(target);
+    }
+  }
+
+  if (!roomActive && lastNukeMs === 0 && pinned) {
+    creatorPubkey = pinned;
+    admins.add(pinned);
+  }
+
+  return {
+    roomActive,
+    epochStartMs,
+    epochInitMs,
+    lastNukeMs,
+    creatorPubkey,
+    admins,
+    bannedPubkeys,
+  };
+}

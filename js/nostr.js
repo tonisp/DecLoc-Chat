@@ -11,12 +11,13 @@ export class RelayPool {
     this.onStatusChange = onStatusChange || (() => {});
     this.onAck = onAck || (() => {});
 
-    this.relays = new Map(); // url -> { ws, status, retries, timer, subId, subKey }
+    this.relays = new Map(); // url -> { ws, status, retries, timer, subId, subKey, outbox }
     this.seenIds = new Set();
     this.channelIds = new Set();
     this.relayChannels = new Map(); // url -> Set(channelId) for strict per-room routing
     this.useChannelRoutes = false;
     this.ackCounts = new Map(); // eventId -> Set(relayUrls)
+    this.probes = new Map(); // probeSubId -> { onEvent, onDone }
     this.subCounter = 0;
     this.destroyed = false;
 
@@ -41,7 +42,7 @@ export class RelayPool {
     // Add new relays
     for (const url of clean) {
       if (!this.relays.has(url)) {
-        const state = { url, ws: null, status: 'connecting', retries: 0, timer: null, subId: null, subKey: '' };
+        const state = { url, ws: null, status: 'connecting', retries: 0, timer: null, subId: null, subKey: '', outbox: [] };
         this.relays.set(url, state);
         this._connect(state);
       }
@@ -150,9 +151,144 @@ export class RelayPool {
         } catch {
           // ignore send errors; reconnect loop handles it
         }
+      } else if (state.status === 'connecting' || (state.ws && state.ws.readyState === WebSocket.CONNECTING)) {
+        // Queue events (e.g. room creator 'init' anchor) so they flush immediately once socket opens
+        if (!Array.isArray(state.outbox)) state.outbox = [];
+        if (state.outbox.length < 40) state.outbox.push(payload);
       }
     }
     return sentTo;
+  }
+
+  // Probe target relays for stored kind:42 events belonging to channelId (used to verify if a room exists before joining/creating).
+  // Reuses already-open pooled WebSockets or opens temporary probe sockets; never pollutes seenIds.
+  async probeChannel(channelId, targetRelayUrls, { timeoutMs = 4500, limit = 100 } = {}) {
+    const cleanUrls = [
+      ...new Set(
+        (Array.isArray(targetRelayUrls) ? targetRelayUrls : [])
+          .map((u) => String(u || '').trim())
+          .filter((u) => u.startsWith('wss://') || u.startsWith('ws://'))
+      ),
+    ];
+    if (!channelId || cleanUrls.length === 0) {
+      return { events: [], respondedRelays: 0, totalRelays: 0 };
+    }
+
+    const eventsById = new Map();
+    const verifyPromises = [];
+    let respondedRelays = 0;
+
+    const collectEvent = (ev) => {
+      if (!ev || typeof ev.id !== 'string' || eventsById.has(ev.id)) return;
+      eventsById.set(ev.id, null); // placeholder to dedupe concurrent relays
+      const p = verifyNostrEvent(ev)
+        .then((valid) => {
+          if (valid) eventsById.set(ev.id, ev);
+          else eventsById.delete(ev.id);
+        })
+        .catch(() => {
+          eventsById.delete(ev.id);
+        });
+      verifyPromises.push(p);
+    };
+
+    const probeOne = (url) =>
+      new Promise((resolve) => {
+        const probeSubId = `probe_${++this.subCounter}_${Math.random().toString(36).slice(2, 7)}`;
+        const filter = { kinds: [CONFIG.MSG_KIND], '#e': [channelId], limit };
+        let done = false;
+        let tempWs = null;
+        let timer = null;
+
+        const finish = (responded) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          if (responded) respondedRelays++;
+          this.probes.delete(probeSubId);
+          const pooled = this.relays.get(url);
+          if (!tempWs && pooled?.ws && pooled.ws.readyState === WebSocket.OPEN) {
+            try {
+              pooled.ws.send(JSON.stringify(['CLOSE', probeSubId]));
+            } catch {
+              // ignore
+            }
+          }
+          if (tempWs) {
+            try {
+              if (tempWs.readyState === WebSocket.OPEN) {
+                tempWs.send(JSON.stringify(['CLOSE', probeSubId]));
+              }
+              tempWs.onclose = null;
+              tempWs.onerror = null;
+              tempWs.onmessage = null;
+              tempWs.close();
+            } catch {
+              // ignore
+            }
+          }
+          resolve();
+        };
+
+        timer = setTimeout(() => finish(false), timeoutMs);
+
+        // Reuse existing open socket in the pool if available (completes in ~10-40ms!)
+        const existing = this.relays.get(url);
+        if (existing?.ws && existing.ws.readyState === WebSocket.OPEN) {
+          this.probes.set(probeSubId, {
+            onEvent: collectEvent,
+            onDone: () => finish(true),
+          });
+          try {
+            existing.ws.send(JSON.stringify(['REQ', probeSubId, filter]));
+            return;
+          } catch {
+            this.probes.delete(probeSubId);
+          }
+        }
+
+        // Otherwise open a clean temporary WebSocket strictly for this probe
+        try {
+          tempWs = new WebSocket(url);
+        } catch {
+          finish(false);
+          return;
+        }
+        tempWs.onopen = () => {
+          if (done) return;
+          try {
+            tempWs.send(JSON.stringify(['REQ', probeSubId, filter]));
+          } catch {
+            finish(false);
+          }
+        };
+        tempWs.onmessage = (evt) => {
+          let msg;
+          try {
+            msg = JSON.parse(evt.data);
+          } catch {
+            return;
+          }
+          if (!Array.isArray(msg) || msg[1] !== probeSubId) return;
+          if (msg[0] === 'EVENT' && msg[2]) {
+            collectEvent(msg[2]);
+          } else if (msg[0] === 'EOSE' || msg[0] === 'CLOSED') {
+            finish(true);
+          }
+        };
+        tempWs.onerror = () => finish(false);
+        tempWs.onclose = () => finish(false);
+      });
+
+    await Promise.all(cleanUrls.map(probeOne));
+    await Promise.all(verifyPromises);
+
+    const verifiedEvents = [...eventsById.values()].filter(Boolean);
+    return {
+      events: verifiedEvents,
+      respondedRelays,
+      totalRelays: cleanUrls.length,
+    };
   }
 
   destroy() {
@@ -195,6 +331,16 @@ export class RelayPool {
       state.retries = 0;
       this._emitStatus();
       this._subscribe(state);
+      if (Array.isArray(state.outbox) && state.outbox.length > 0) {
+        const queued = state.outbox.splice(0, state.outbox.length);
+        for (const payload of queued) {
+          try {
+            ws.send(payload);
+          } catch {
+            // ignore
+          }
+        }
+      }
     };
 
     ws.onmessage = (evt) => {
@@ -277,6 +423,17 @@ export class RelayPool {
     if (!Array.isArray(msg) || msg.length < 2) return;
 
     const type = msg[0];
+    // Route one-shot probe replies without polluting seenIds or live handlers
+    if ((type === 'EVENT' || type === 'EOSE' || type === 'CLOSED') && typeof msg[1] === 'string' && this.probes.has(msg[1])) {
+      const probe = this.probes.get(msg[1]);
+      if (type === 'EVENT' && msg[2]) {
+        probe.onEvent(msg[2]);
+      } else {
+        probe.onDone();
+      }
+      return;
+    }
+
     if (type === 'EVENT' && msg[2]) {
       const ev = msg[2];
       if (!ev || typeof ev.id !== 'string') return;
