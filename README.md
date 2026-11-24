@@ -136,8 +136,10 @@ If you want a **permanent address** (like `https://chat.yourdomain.com`) that ne
    bash relay/start-termux.sh --token YOUR_CLOUDFLARE_TUNNEL_TOKEN
    ```
 
-#### Optional: Keep Running in the Background While Using Termux (`tmux`)
-To keep the server running in the background while typing other commands in Termux (do **not** press `Ctrl + C`, which stops the server):
+#### Optional: Keep Running in the Background While Using Termux (New Session or `tmux`)
+Do **not** press `Ctrl + C` (that stops the server):
+* **Easiest way in Termux:** swipe from the left edge of the screen → tap **NEW SESSION** to open a second terminal tab while the server keeps running in the first session.
+* **Or use `tmux`** (especially handy over SSH):
 ```bash
 pkg install -y tmux
 tmux new -s decloc
@@ -426,8 +428,10 @@ Kui tahad **püsivat aadressi** (nt `https://chat.sinudomeen.ee`), mis restardil
    bash relay/start-termux.sh --token SINU_CLOUDFLARE_TUNNELI_TOKEN
    ```
 
-#### Valikuline: jäta server Termuxis taustale jooksma (`tmux`)
-Kui tahad samal ajal Termuxis muid käske kirjutada (ära vajuta `Ctrl + C`, sest see peatab serveri), kasuta `tmux`-i:
+#### Valikuline: jäta server Termuxis taustale jooksma (uus sessioon või `tmux`)
+Ära vajuta `Ctrl + C` (see peatab serveri):
+* **Kõige lihtsam viis Termuxis:** tõmba ekraani vasakust servast menüü lahti → vajuta **NEW SESSION** — server jääb esimesse sessiooni edasi jooksma ja saad uues sessioonis muid käske kirjutada (midagi pole vaja juurde paigaldada).
+* **Või kasuta `tmux`-i** (eriti mugav üle SSH):
 ```bash
 pkg install -y tmux
 tmux new -s decloc

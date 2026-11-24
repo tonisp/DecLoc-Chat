@@ -154,6 +154,156 @@ function formatRelayHost(url) {
   return String(url || '').replace(/^wss?:\/\//, '').replace(/\/+$/, '');
 }
 
+function isStandalonePwa() {
+  try {
+    return (
+      window.matchMedia('(display-mode: standalone)').matches ||
+      window.matchMedia('(display-mode: fullscreen)').matches ||
+      window.matchMedia('(display-mode: minimal-ui)').matches ||
+      window.navigator.standalone === true
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function queryStandalonePermStates() {
+  const notif = 'Notification' in window ? Notification.permission : 'unsupported';
+  const queryMedia = async (name) => {
+    try {
+      if (navigator.permissions?.query) {
+        const res = await navigator.permissions.query({ name });
+        return res?.state || 'prompt';
+      }
+    } catch {
+      // Safari / older Firefox may not expose camera/microphone in permissions.query
+    }
+    return 'prompt';
+  };
+  const [mic, cam] = await Promise.all([queryMedia('microphone'), queryMedia('camera')]);
+  return { notif, mic, cam };
+}
+
+function renderPwaPermChips(states) {
+  const applyChip = (chipId, stateId, st) => {
+    const chip = $(chipId);
+    const label = $(stateId);
+    if (!chip || !label) return;
+    chip.classList.toggle('is-granted', st === 'granted');
+    chip.classList.toggle('is-denied', st === 'denied');
+    label.textContent =
+      st === 'granted'
+        ? t('pwaPermStateGranted')
+        : st === 'denied'
+          ? t('pwaPermStateDenied')
+          : t('pwaPermStatePending');
+  };
+  applyChip('pwaPermNotifChip', 'pwaPermNotifState', states.notif);
+  applyChip('pwaPermMicChip', 'pwaPermMicState', states.mic);
+  applyChip('pwaPermCamChip', 'pwaPermCamState', states.cam);
+}
+
+// Activate Notifications + Push + Microphone + Camera in one tap (for installed standalone PWA only)
+async function activateStandalonePwaPermissions({ silentToast = false } = {}) {
+  let notifGranted = false;
+  let micGranted = false;
+  let camGranted = false;
+
+  // 1. OS Notifications + VAPID Web Push (makes the bell icon immediately green)
+  if ('Notification' in window) {
+    const perm = await requestNotificationPermission();
+    if (perm === 'granted') {
+      notifGranted = true;
+      settings.notifications = true;
+      settings.notificationsExplicitOff = false;
+      saveSettings(settings);
+      renderNotifyButtonState();
+      syncPushRegistration();
+    }
+  }
+
+  // 2. Microphone & Camera pre-authorization (immediately stops tracks so hardware turns right off)
+  if (navigator.mediaDevices?.getUserMedia) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+      stream.getTracks().forEach((tr) => tr.stop());
+      micGranted = true;
+      camGranted = true;
+    } catch {
+      try {
+        const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        audioStream.getTracks().forEach((tr) => tr.stop());
+        micGranted = true;
+      } catch {
+        // user declined or device has no audio/video
+      }
+    }
+  }
+
+  settings.pwaSetupDone = true;
+  saveSettings(settings);
+  renderNotifyButtonState();
+
+  const updatedStates = await queryStandalonePermStates();
+  const effectiveStates = {
+    notif: notifGranted ? 'granted' : updatedStates.notif,
+    mic: micGranted ? 'granted' : updatedStates.mic,
+    cam: camGranted ? 'granted' : updatedStates.cam,
+  };
+  renderPwaPermChips(effectiveStates);
+
+  if (notifGranted) {
+    playMessageSound();
+    vibrateDevice([150, 80, 150]);
+  }
+  if (!silentToast) {
+    const allOk = notifGranted && micGranted;
+    showToast(allOk ? t('pwaPermsReadyToast') : t('pwaPermsPartialToast'), 4500);
+  }
+  return effectiveStates;
+}
+
+async function openPwaSetupModal() {
+  const states = await queryStandalonePermStates();
+  renderPwaPermChips(states);
+  showOverlay('pwaSetupModal');
+}
+
+async function maybeInitStandalonePwaPermissions() {
+  if (!isStandalonePwa()) return;
+
+  // Default notifications & Web Push ON in installed standalone PWA if permission is already granted
+  if (
+    'Notification' in window &&
+    Notification.permission === 'granted' &&
+    !settings.notificationsExplicitOff
+  ) {
+    if (!settings.notifications) {
+      settings.notifications = true;
+      saveSettings(settings);
+    }
+    renderNotifyButtonState();
+    await syncPushRegistration();
+  }
+
+  const states = await queryStandalonePermStates();
+  const allGranted =
+    states.notif === 'granted' && states.mic === 'granted' && states.cam === 'granted';
+  if (allGranted) {
+    if (!settings.pwaSetupDone) {
+      settings.pwaSetupDone = true;
+      saveSettings(settings);
+    }
+    return;
+  }
+
+  // First launch inside installed standalone PWA: show 1-tap activation modal for Push, Mic & Camera
+  if (!settings.pwaSetupDone) {
+    renderPwaPermChips(states);
+    showOverlay('pwaSetupModal');
+  }
+}
+
 async function detectSelfHostedRelay() {
   try {
     const res = await fetch('./decloc-relay.json', { cache: 'no-store' });
@@ -194,6 +344,13 @@ async function init() {
       }
     });
   }
+
+  // When user installs the standalone app, ensure the newly installed app runs 1-tap permission setup on first launch
+  window.addEventListener('appinstalled', () => {
+    settings.pwaSetupDone = false;
+    settings.notificationsExplicitOff = false;
+    saveSettings(settings);
+  });
 
   // Capture any #join=... invite from URL immediately and strip hash from bar
   pendingInvite = consumeInviteFromUrl();
@@ -252,6 +409,8 @@ function openWelcomeOverlay() {
     $('welcomeInviteBanner').classList.add('hidden');
     $('welcomeSubmitBtn').textContent = t('startBtn');
   }
+  $('welcomePwaPermsRow').classList.toggle('hidden', !isStandalonePwa());
+  $('welcomePwaPermsCheck').checked = true;
   showOverlay('welcomeOverlay');
   $('welcomeNameInput').focus();
 }
@@ -308,6 +467,9 @@ async function startApp() {
   syncSubscriptions();
   renderRoomList();
   updateTabTitle();
+
+  // Standalone installed PWA: auto-activate green bell / Web Push and offer 1-tap mic+cam+push setup
+  maybeInitStandalonePwaPermissions().catch(() => {});
 
   // Presence heartbeat & pruning
   setInterval(() => {
@@ -4220,6 +4382,7 @@ function openSettingsModal() {
   $('settingsTurnPassInput').value = settings.turnPass || '';
   $('settingsGiphyKeyInput').value = settings.giphyApiKey || '';
   renderWebPushStatus();
+  $('pwaReopenPermsBtn').classList.toggle('hidden', !isStandalonePwa());
   renderPublicRelaysChecklist();
   showOverlay('settingsModal');
 }
@@ -4311,11 +4474,17 @@ function bindEvents() {
     }
     const userPass = $('welcomePassInput').value;
     const lockDevice = userPass.length > 0 && $('welcomeLockCheck').checked;
+    const wantPwaPerms = isStandalonePwa() && $('welcomePwaPermsCheck').checked;
     const btn = $('welcomeSubmitBtn');
     btn.disabled = true;
-    btn.textContent = t('derivingKeys');
+    btn.textContent = wantPwaPerms ? t('pwaActivatingBtn') : t('derivingKeys');
 
     try {
+      // Request installed standalone PWA permissions immediately inside user tap gesture (before PBKDF2 delay)
+      if (wantPwaPerms) {
+        await activateStandalonePwaPermissions({ silentToast: true });
+        btn.textContent = t('derivingKeys');
+      }
       settings.name = name.slice(0, 32);
       if (userPass.length > 0) {
         activeMasterSeed = await deriveMasterSeedFromPassword(settings.name, userPass);
@@ -4411,6 +4580,7 @@ function bindEvents() {
       settings.notifications && 'Notification' in window && Notification.permission === 'granted';
     if (currentlyActive) {
       settings.notifications = false;
+      settings.notificationsExplicitOff = true;
       saveSettings(settings);
       renderNotifyButtonState();
       await syncPushRegistration();
@@ -4420,6 +4590,7 @@ function bindEvents() {
     const perm = await requestNotificationPermission();
     if (perm === 'granted') {
       settings.notifications = true;
+      settings.notificationsExplicitOff = false;
       saveSettings(settings);
       playMessageSound();
       vibrateDevice([150, 80, 150]);
@@ -4432,6 +4603,33 @@ function bindEvents() {
       renderNotifyButtonState();
       showToast(t('notifyDeniedToast'), 4500);
     }
+  });
+
+  // Standalone installed PWA 1-tap permissions modal buttons
+  $('pwaActivatePermsBtn').addEventListener('click', async () => {
+    const btn = $('pwaActivatePermsBtn');
+    btn.disabled = true;
+    btn.textContent = t('pwaActivatingBtn');
+    try {
+      await activateStandalonePwaPermissions();
+      hideOverlay('pwaSetupModal');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = t('pwaActivatePermsBtn');
+    }
+  });
+
+  const dismissPwaPerms = () => {
+    settings.pwaSetupDone = true;
+    saveSettings(settings);
+    hideOverlay('pwaSetupModal');
+  };
+  $('pwaDismissPermsBtn').addEventListener('click', dismissPwaPerms);
+  $('pwaSetupCloseBtn').addEventListener('click', dismissPwaPerms);
+
+  $('pwaReopenPermsBtn').addEventListener('click', async () => {
+    hideOverlay('settingsModal');
+    await openPwaSetupModal();
   });
   $('settingsBtn').addEventListener('click', openSettingsModal);
   $('relayStatusBtn').addEventListener('click', openSettingsModal);
@@ -5017,6 +5215,7 @@ function bindEvents() {
         $('settingsNotifyCheck').checked = true;
         if (!settings.notifications) {
           settings.notifications = true;
+          settings.notificationsExplicitOff = false;
           saveSettings(settings);
           renderNotifyButtonState();
           syncPushRegistration();
@@ -5061,6 +5260,7 @@ function bindEvents() {
     settings.lang = $('settingsLangSelect').value;
     settings.sound = $('settingsSoundCheck').checked;
     settings.notifications = $('settingsNotifyCheck').checked;
+    settings.notificationsExplicitOff = !settings.notifications;
     settings.readReceipts = $('settingsReadReceiptsCheck').checked;
     settings.ntfyUrl = normalizeNtfyUrl($('settingsNtfyUrlInput').value);
     settings.turnUrl = $('settingsTurnUrlInput').value.trim();
