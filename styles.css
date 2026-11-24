@@ -1141,15 +1141,19 @@ input:focus, textarea:focus, select:focus {
 }
 
 .msg-act-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: none;
   background: transparent;
   cursor: pointer;
-  padding: 3px 5px;
+  padding: 4px 5px;
   border-radius: 999px;
-  font-size: 0.82rem;
+  font-size: 0.86rem;
   line-height: 1;
   color: var(--text-muted);
 }
+.msg-act-btn svg { display: block; }
 .msg-act-btn:hover { background: var(--bg-hover); color: var(--text); }
 .msg-act-btn-danger:hover { background: var(--danger-soft); color: var(--danger); }
 

@@ -57,7 +57,53 @@ import {
   sendNtfyPing,
 } from './notify.js';
 
-const REACT_EMOJIS = ['👍', '❤️', '😂', '🎉'];
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+function createActionSvgIcon(kind) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('width', '15');
+  svg.setAttribute('height', '15');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  svg.setAttribute('aria-hidden', 'true');
+
+  if (kind === 'smile') {
+    const face = document.createElementNS(SVG_NS, 'circle');
+    face.setAttribute('cx', '12');
+    face.setAttribute('cy', '12');
+    face.setAttribute('r', '9.5');
+    const smile = document.createElementNS(SVG_NS, 'path');
+    smile.setAttribute('d', 'M8.5 14.5c1 1.6 2.2 2.2 3.5 2.2s2.5-.6 3.5-2.2');
+    const eyeL = document.createElementNS(SVG_NS, 'circle');
+    eyeL.setAttribute('cx', '9');
+    eyeL.setAttribute('cy', '10');
+    eyeL.setAttribute('r', '0.8');
+    eyeL.setAttribute('fill', 'currentColor');
+    const eyeR = document.createElementNS(SVG_NS, 'circle');
+    eyeR.setAttribute('cx', '15');
+    eyeR.setAttribute('cy', '10');
+    eyeR.setAttribute('r', '0.8');
+    eyeR.setAttribute('fill', 'currentColor');
+    svg.append(face, smile, eyeL, eyeR);
+  } else if (kind === 'trash') {
+    const lid = document.createElementNS(SVG_NS, 'path');
+    lid.setAttribute('d', 'M3 6h18');
+    const handle = document.createElementNS(SVG_NS, 'path');
+    handle.setAttribute('d', 'M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2');
+    const bin = document.createElementNS(SVG_NS, 'path');
+    bin.setAttribute('d', 'M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6');
+    const lineL = document.createElementNS(SVG_NS, 'path');
+    lineL.setAttribute('d', 'M10 11v6');
+    const lineR = document.createElementNS(SVG_NS, 'path');
+    lineR.setAttribute('d', 'M14 11v6');
+    svg.append(lid, handle, bin, lineL, lineR);
+  }
+  return svg;
+}
 
 const $ = (id) => document.getElementById(id);
 
@@ -2649,7 +2695,7 @@ function renderMessages(scrollToBottom) {
       bubble.appendChild(img);
     }
 
-    // Action buttons (Reply + Quick Reactions + Full Emoji Reaction + Own Message Delete)
+    // Action buttons (Reply + Emoji Reaction Picker + Own Message Delete)
     const actions = document.createElement('div');
     actions.className = 'msg-actions';
 
@@ -2657,6 +2703,7 @@ function renderMessages(scrollToBottom) {
     replyBtn.type = 'button';
     replyBtn.className = 'msg-act-btn';
     replyBtn.title = t('replyAction');
+    replyBtn.setAttribute('aria-label', t('replyAction'));
     replyBtn.textContent = '↩';
     replyBtn.addEventListener('click', () => {
       replyTarget = { id: m.id, pubkey: m.pubkey, name: m.name, text: m.text || '[GIF]' };
@@ -2665,20 +2712,12 @@ function renderMessages(scrollToBottom) {
     });
     actions.appendChild(replyBtn);
 
-    for (const emoji of REACT_EMOJIS) {
-      const rb = document.createElement('button');
-      rb.type = 'button';
-      rb.className = 'msg-act-btn';
-      rb.textContent = emoji;
-      rb.addEventListener('click', () => toggleReaction(m.id, emoji));
-      actions.appendChild(rb);
-    }
-
     const moreReactBtn = document.createElement('button');
     moreReactBtn.type = 'button';
     moreReactBtn.className = 'msg-act-btn';
     moreReactBtn.title = t('reactMoreAction');
-    moreReactBtn.textContent = '＋';
+    moreReactBtn.setAttribute('aria-label', t('reactMoreAction'));
+    moreReactBtn.appendChild(createActionSvgIcon('smile'));
     moreReactBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       openPicker({ tab: 'emoji', reactTargetMsgId: m.id });
@@ -2691,7 +2730,7 @@ function renderMessages(scrollToBottom) {
       delBtn.className = 'msg-act-btn msg-act-btn-danger';
       delBtn.title = t('deleteMsgAction');
       delBtn.setAttribute('aria-label', t('deleteMsgAction'));
-      delBtn.textContent = '🗑';
+      delBtn.appendChild(createActionSvgIcon('trash'));
       delBtn.addEventListener('click', async () => {
         if (!confirm(t('deleteMsgConfirm'))) return;
         const count = await deleteOwnMessages(state.room.channelId, [m.id]);

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'decloc-shell-v16';
+const CACHE_NAME = 'decloc-shell-v17';
 const ASSETS = [
   './',
   './index.html',
