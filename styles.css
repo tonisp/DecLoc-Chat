@@ -2092,47 +2092,6 @@ input:focus, textarea:focus, select:focus {
   font-weight: 600;
 }
 
-/* Standalone PWA Permissions Modal */
-.pwa-perm-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.pwa-perm-chip {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  border-radius: 12px;
-  border: 1px solid var(--border);
-  background: var(--bg-elev);
-  font-size: 0.9rem;
-}
-
-.pwa-perm-state {
-  margin-left: auto;
-  font-size: 0.78rem;
-  font-weight: 600;
-  color: var(--text-muted);
-}
-
-.pwa-perm-chip.is-granted {
-  border-color: rgba(34, 197, 94, 0.45);
-  background: rgba(34, 197, 94, 0.1);
-}
-.pwa-perm-chip.is-granted .pwa-perm-state {
-  color: var(--ok);
-}
-
-.pwa-perm-chip.is-denied {
-  border-color: rgba(239, 68, 68, 0.45);
-  background: var(--danger-soft);
-}
-.pwa-perm-chip.is-denied .pwa-perm-state {
-  color: var(--danger);
-}
-
 /* Toasts */
 .toast-container {
   position: fixed;

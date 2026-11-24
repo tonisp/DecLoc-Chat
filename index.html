@@ -75,10 +75,6 @@
           <input id="welcomeLockCheck" type="checkbox">
           <span class="small" data-i18n="userPassLockLabel">Require this password on this device</span>
         </label>
-        <label id="welcomePwaPermsRow" class="checkbox-row hidden">
-          <input id="welcomePwaPermsCheck" type="checkbox" checked>
-          <span class="small" data-i18n="pwaWelcomePermsLabel">Activate notifications (Push), microphone & camera immediately for this app</span>
-        </label>
         <details class="info-box">
           <summary data-i18n="userPassExplainTitle">What does a personal password do & where is it stored?</summary>
           <ul class="info-list">
@@ -527,34 +523,19 @@
     </div>
   </div>
 
-  <!-- Standalone PWA First-Launch Permissions Modal (only shown in installed standalone app) -->
-  <div id="pwaSetupModal" class="overlay hidden" role="dialog" aria-modal="true">
+  <!-- Standalone PWA Per-Call Media Permission Modal (always asks before mic/camera in calls) -->
+  <div id="callPermModal" class="overlay hidden" role="dialog" aria-modal="true">
     <div class="modal card">
       <div class="modal-header">
-        <h3 data-i18n="pwaSetupTitle">📲 Aktiveeri rakenduse load</h3>
-        <button id="pwaSetupCloseBtn" type="button" class="icon-btn modal-close" data-close-modal="pwaSetupModal">✕</button>
+        <h3 id="callPermTitle">🎙️ Mikrofoni luba</h3>
+        <button id="callPermCloseBtn" type="button" class="icon-btn modal-close">✕</button>
       </div>
       <div class="stack">
-        <p class="muted" data-i18n="pwaSetupDesc"></p>
-        <div class="pwa-perm-list">
-          <div id="pwaPermNotifChip" class="pwa-perm-chip">
-            <span>🔔</span>
-            <span data-i18n="pwaPermNotifLabel">Teavitused ja Push</span>
-            <span id="pwaPermNotifState" class="pwa-perm-state"></span>
-          </div>
-          <div id="pwaPermMicChip" class="pwa-perm-chip">
-            <span>🎙️</span>
-            <span data-i18n="pwaPermMicLabel">Mikrofon</span>
-            <span id="pwaPermMicState" class="pwa-perm-state"></span>
-          </div>
-          <div id="pwaPermCamChip" class="pwa-perm-chip">
-            <span>📷</span>
-            <span data-i18n="pwaPermCamLabel">Kaamera</span>
-            <span id="pwaPermCamState" class="pwa-perm-state"></span>
-          </div>
+        <p id="callPermDesc" class="muted"></p>
+        <div class="modal-footer">
+          <button id="callPermCancelBtn" type="button" class="btn btn-ghost" data-i18n="cancelBtn">Tühista</button>
+          <button id="callPermAllowBtn" type="button" class="btn btn-primary">Luba</button>
         </div>
-        <button id="pwaActivatePermsBtn" type="button" class="btn btn-primary" data-i18n="pwaActivatePermsBtn">✓ Aktiveeri teavitused, mikrofon ja kaamera</button>
-        <button id="pwaDismissPermsBtn" type="button" class="btn btn-ghost btn-sm" data-i18n="pwaLaterBtn">Hiljem</button>
       </div>
     </div>
   </div>
@@ -632,7 +613,6 @@
           <div id="webPushStatusText" class="hint-text hidden"></div>
           <div class="row-gap">
             <button id="testNotifyBtn" type="button" class="btn btn-secondary btn-sm" data-i18n="testNotifyBtn">Test sound & alert</button>
-            <button id="pwaReopenPermsBtn" type="button" class="btn btn-secondary btn-sm hidden" data-i18n="pwaReopenPermsBtn">App permissions (Push, Mic, Cam)</button>
           </div>
           <div class="divider"></div>
           <label class="field">
