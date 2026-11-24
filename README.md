@@ -115,8 +115,9 @@ cd decloc-chat
 
 **Step 4: Start the chat server + free no-account tunnel**
 ```bash
-./relay/start-termux.sh
+bash relay/start-termux.sh
 ```
+*(Or make it executable once with `chmod +x relay/start-termux.sh && ./relay/start-termux.sh`.)*
 After a few seconds, Termux prints a public link that looks like:
 ```text
 https://something-random.trycloudflare.com
@@ -132,8 +133,22 @@ If you want a **permanent address** (like `https://chat.yourdomain.com`) that ne
 2. Go to **Zero Trust → Networks → Tunnels → Create a tunnel**, point `chat.yourdomain.com` to `http://127.0.0.1:7777`, and copy the tunnel token.
 3. Run in Termux:
    ```bash
-   ./relay/start-termux.sh --token YOUR_CLOUDFLARE_TUNNEL_TOKEN
+   bash relay/start-termux.sh --token YOUR_CLOUDFLARE_TUNNEL_TOKEN
    ```
+
+#### Optional: Keep Running in the Background While Using Termux (`tmux`)
+To keep the server running in the background while typing other commands in Termux (do **not** press `Ctrl + C`, which stops the server):
+```bash
+pkg install -y tmux
+tmux new -s decloc
+bash relay/start-termux.sh
+```
+* Once the link appears on screen, press **`Ctrl + B`**, release, and press **`D`** (*detach*) — the server keeps running in the background and you can use Termux normally.
+* To reopen the server screen later:
+  ```bash
+  tmux attach -t decloc
+  ```
+* Also tap **Acquire wakelock** on the Termux notification in Android's notification shade so Android does not put the server to sleep.
 
 > **Battery tip:** If an old phone stays plugged in 24/7, enable a battery charge limit (60–80%) in Android settings if your phone supports it, so the battery stays healthy long-term.
 
@@ -390,8 +405,9 @@ cd decloc-chat
 
 **Samm 4: Käivita server + tasuta kontovaba tunnel**
 ```bash
-./relay/start-termux.sh
+bash relay/start-termux.sh
 ```
+*(Või anna skriptile käivitusõigus: `chmod +x relay/start-termux.sh && ./relay/start-termux.sh`.)*
 Mõne sekundi pärast ilmub ekraanile avalik aadress kujul:
 ```text
 https://suvaline-nimi.trycloudflare.com
@@ -407,8 +423,22 @@ Kui tahad **püsivat aadressi** (nt `https://chat.sinudomeen.ee`), mis restardil
 2. Ava Cloudflare'is **Zero Trust → Networks → Tunnels → Create a tunnel**, suuna `chat.sinudomeen.ee` aadressile `http://127.0.0.1:7777` ja kopeeri tunneli token.
 3. Käivita Termuxis:
    ```bash
-   ./relay/start-termux.sh --token SINU_CLOUDFLARE_TUNNELI_TOKEN
+   bash relay/start-termux.sh --token SINU_CLOUDFLARE_TUNNELI_TOKEN
    ```
+
+#### Valikuline: jäta server Termuxis taustale jooksma (`tmux`)
+Kui tahad samal ajal Termuxis muid käske kirjutada (ära vajuta `Ctrl + C`, sest see peatab serveri), kasuta `tmux`-i:
+```bash
+pkg install -y tmux
+tmux new -s decloc
+bash relay/start-termux.sh
+```
+* Kui link on ekraanil, vajuta **`Ctrl + B`**, lase lahti ja vajuta **`D`** — server jääb taustale edasi jooksma ja saad Termuxi tavapäraselt edasi kasutada.
+* Hiljem saad serveri ekraani uuesti avada käsuga:
+  ```bash
+  tmux attach -t decloc
+  ```
+* Vajuta Androidi teavitusribal Termuxi teavituse all ka **„Acquire wakelock“**, et Android serverit unerežiimis kinni ei paneks.
 
 > **Aku nipp:** Kui vana telefon on 24/7 laadija otsas, lülita võimalusel Androidi akuseadetest sisse laadimispiirang (60–80%), et aku pikalt terve püsiks.
 
